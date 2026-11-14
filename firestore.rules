@@ -1,0 +1,511 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isTenantOwner(tenantId) {
+      return isVerified() && request.auth.uid == tenantId;
+    }
+
+    function tenantExistsAndOwned(tenantId) {
+      return exists(/databases/$(database)/documents/tenants/$(tenantId)) &&
+        get(/databases/$(database)/documents/tenants/$(tenantId)).data.ownerId == request.auth.uid;
+    }
+
+    function isAdmin() {
+      return isVerified() && exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+
+    function isValidSha256Id(id) {
+      return id is string && id.size() == 64 && id.matches('^[a-f0-9]{64}$');
+    }
+
+    function isValidDateString(val) {
+      return val is string && val.size() == 10 && val.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$');
+    }
+
+    function isValidCurrency(val) {
+      return val in ['USD', 'EGP', 'EUR', 'GBP', 'CAD', 'AUD'];
+    }
+
+    function isValidInvitation(data, inviteId) {
+      return data.id is string && isValidSha256Id(data.id) && data.id == inviteId &&
+        data.codeHash is string && isValidSha256Id(data.codeHash) && data.codeHash == inviteId &&
+        data.codePreview is string && data.codePreview.size() >= 4 && data.codePreview.size() <= 32 &&
+        data.label is string && data.label.size() <= 120 &&
+        data.createdByUid is string && isValidId(data.createdByUid) &&
+        data.status in ['active', 'used', 'revoked'] &&
+        data.maxUses is int && data.maxUses >= 1 && data.maxUses <= 100 &&
+        data.usedCount is int && data.usedCount >= 0 && data.usedCount <= data.maxUses &&
+        data.expiresAt is timestamp &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp &&
+        (!('revokedAt' in data) || data.revokedAt is timestamp);
+    }
+
+    function isValidRedemption(data, inviteId, redeemerUid) {
+      return data.inviteId is string && isValidSha256Id(data.inviteId) && data.inviteId == inviteId &&
+        data.uid is string && isValidId(data.uid) && data.uid == redeemerUid && data.uid == request.auth.uid &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 160 &&
+        data.displayName is string && data.displayName.size() <= 120 &&
+        data.provider is string && data.provider.size() >= 1 && data.provider.size() <= 40 &&
+        data.redeemedAt is timestamp;
+    }
+
+    function isValidTenantProfile(data, tenantId) {
+      return data.ownerId is string && isValidId(data.ownerId) && data.ownerId == tenantId && data.ownerId == request.auth.uid &&
+        data.businessName is string && data.businessName.size() >= 1 && data.businessName.size() <= 100 &&
+        data.ownerEmail is string && data.ownerEmail.size() >= 3 && data.ownerEmail.size() <= 160 &&
+        (!('fullName' in data) || (data.fullName is string && data.fullName.size() <= 120)) &&
+        (!('photoUrl' in data) || (data.photoUrl is string && data.photoUrl.size() <= 500)) &&
+        (!('role' in data) || data.role in ['owner', 'admin', 'user']) &&
+        (!('accountStatus' in data) || data.accountStatus in ['active', 'suspended']) &&
+        (!('invitationId' in data) || isValidSha256Id(data.invitationId)) &&
+        isValidCurrency(data.currency) &&
+        (!('usdToEgpRate' in data) || (data.usdToEgpRate is number && data.usdToEgpRate > 0 && data.usdToEgpRate <= 10000)) &&
+        (!('legacyCurrency' in data) || isValidCurrency(data.legacyCurrency)) &&
+        (!('language' in data) || data.language in ['en', 'ar']) &&
+        (!('exchangeRateMode' in data) || data.exchangeRateMode in ['cbe_official', 'manual_override']) &&
+        (!('cbeBuyRate' in data) || (data.cbeBuyRate is number && data.cbeBuyRate > 0 && data.cbeBuyRate <= 10000)) &&
+        (!('cbeSellRate' in data) || (data.cbeSellRate is number && data.cbeSellRate > 0 && data.cbeSellRate <= 10000)) &&
+        (!('cbePublicationDate' in data) || isValidDateString(data.cbePublicationDate)) &&
+        (!('cbeLastSyncedAt' in data) || (data.cbeLastSyncedAt is string && data.cbeLastSyncedAt.size() >= 1 && data.cbeLastSyncedAt.size() <= 40)) &&
+        (!('cbeSource' in data) || (data.cbeSource is string && data.cbeSource.size() >= 1 && data.cbeSource.size() <= 80)) &&
+        data.taxRate is number && data.taxRate >= 0 && data.taxRate <= 100 &&
+        data.lowStockThreshold is int && data.lowStockThreshold >= 0 && data.lowStockThreshold <= 1000 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidProduct(data, tenantId) {
+      return data.ownerId is string && isValidId(data.ownerId) && data.ownerId == tenantId && data.ownerId == request.auth.uid &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 120 &&
+        data.sku is string && data.sku.size() >= 1 && data.sku.size() <= 40 &&
+        data.category is string && data.category.size() >= 1 && data.category.size() <= 60 &&
+        data.price is number && data.price >= 0 && data.price <= 100000000 &&
+        data.cost is number && data.cost >= 0 && data.cost <= 100000000 &&
+        (!('currency' in data) || isValidCurrency(data.currency)) &&
+        data.stock is int && data.stock >= 0 && data.stock <= 10000000 &&
+        data.status in ['active', 'draft', 'archived'] &&
+        data.imageKey is string && data.imageKey.size() <= 60 &&
+        data.description is string && data.description.size() <= 500 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidCustomer(data, tenantId) {
+      return data.ownerId is string && isValidId(data.ownerId) && data.ownerId == tenantId && data.ownerId == request.auth.uid &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 120 &&
+        data.email is string && data.email.size() <= 160 &&
+        data.phone is string && data.phone.size() <= 40 &&
+        data.location is string && data.location.size() <= 120 &&
+        (!('shippingAddress' in data) || (data.shippingAddress is string && data.shippingAddress.size() <= 240)) &&
+        (!('city' in data) || (data.city is string && data.city.size() <= 80)) &&
+        (!('country' in data) || (data.country is string && data.country.size() <= 80)) &&
+        data.notes is string && data.notes.size() <= 400 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidOrder(data, tenantId) {
+      return data.ownerId is string && isValidId(data.ownerId) && data.ownerId == tenantId && data.ownerId == request.auth.uid &&
+        data.orderNumber is string && data.orderNumber.size() >= 1 && data.orderNumber.size() <= 40 &&
+        data.customerId is string && isValidId(data.customerId) &&
+        data.customerName is string && data.customerName.size() >= 1 && data.customerName.size() <= 120 &&
+        data.customerEmail is string && data.customerEmail.size() <= 160 &&
+        data.customerPhone is string && data.customerPhone.size() <= 40 &&
+        data.shippingAddress is string && data.shippingAddress.size() <= 240 &&
+        data.status in ['pending', 'processing', 'shipped', 'delivered', 'cancelled', 'returned'] &&
+        data.channel in ['Direct Store', 'Wholesale', 'Marketplace', 'Manual'] &&
+        data.subtotal is number && data.subtotal >= 0 && data.subtotal <= 1000000000 &&
+        data.discountAmount is number && data.discountAmount >= 0 && data.discountAmount <= 1000000000 &&
+        data.taxAmount is number && data.taxAmount >= 0 && data.taxAmount <= 1000000000 &&
+        data.shippingCost is number && data.shippingCost >= 0 && data.shippingCost <= 100000000 &&
+        data.totalAmount is number && data.totalAmount >= 0 && data.totalAmount <= 1000000000 &&
+        data.totalCost is number && data.totalCost >= 0 && data.totalCost <= 1000000000 &&
+        (!('currency' in data) || isValidCurrency(data.currency)) &&
+        (!('exchangeRate' in data) || (data.exchangeRate is number && data.exchangeRate > 0 && data.exchangeRate <= 10000)) &&
+        (!('convertedAmount' in data) || (data.convertedAmount is number && data.convertedAmount >= 0 && data.convertedAmount <= 10000000000)) &&
+        (!('reportingCurrency' in data) || isValidCurrency(data.reportingCurrency)) &&
+        (!('rateSource' in data) || (data.rateSource is string && data.rateSource.size() >= 1 && data.rateSource.size() <= 120)) &&
+        (!('conversionDirection' in data) || (data.conversionDirection is string && data.conversionDirection.size() >= 3 && data.conversionDirection.size() <= 20)) &&
+        (!('ratePublicationDate' in data) || isValidDateString(data.ratePublicationDate)) &&
+        (!('rateTimestamp' in data) || (data.rateTimestamp is string && data.rateTimestamp.size() >= 1 && data.rateTimestamp.size() <= 40)) &&
+        data.itemCount is int && data.itemCount >= 1 && data.itemCount <= 10000 &&
+        data.itemsSummary is string && data.itemsSummary.size() >= 1 && data.itemsSummary.size() <= 300 &&
+        isValidDateString(data.orderDate) &&
+        data.notes is string && data.notes.size() <= 500 &&
+        data.stockDeducted is bool &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidOrderItem(data, tenantId) {
+      return data.ownerId is string && isValidId(data.ownerId) && data.ownerId == tenantId && data.ownerId == request.auth.uid &&
+        data.productId is string && isValidId(data.productId) &&
+        data.productName is string && data.productName.size() >= 1 && data.productName.size() <= 120 &&
+        data.sku is string && data.sku.size() >= 1 && data.sku.size() <= 40 &&
+        data.variant is string && data.variant.size() >= 1 && data.variant.size() <= 80 &&
+        data.quantity is int && data.quantity >= 1 && data.quantity <= 100000 &&
+        data.unitPrice is number && data.unitPrice >= 0 && data.unitPrice <= 100000000 &&
+        data.unitCost is number && data.unitCost >= 0 && data.unitCost <= 100000000 &&
+        data.lineTotal is number && data.lineTotal >= 0 && data.lineTotal <= 1000000000;
+    }
+
+    function isValidOrderHistory(data, tenantId) {
+      return data.ownerId is string && isValidId(data.ownerId) && data.ownerId == tenantId && data.ownerId == request.auth.uid &&
+        data.status in ['pending', 'processing', 'shipped', 'delivered', 'cancelled', 'returned'] &&
+        data.title is string && data.title.size() >= 1 && data.title.size() <= 160 &&
+        data.detail is string && data.detail.size() <= 300 &&
+        data.createdAt is timestamp;
+    }
+
+    function isValidExpense(data, tenantId) {
+      return data.ownerId is string && isValidId(data.ownerId) && data.ownerId == tenantId && data.ownerId == request.auth.uid &&
+        data.title is string && data.title.size() >= 1 && data.title.size() <= 120 &&
+        data.category in ['Marketing', 'Shipping', 'Packaging', 'Software', 'Operations', 'Other', 'Inventory', 'Payroll'] &&
+        data.vendor is string && data.vendor.size() >= 1 && data.vendor.size() <= 100 &&
+        data.amount is number && data.amount >= 0 && data.amount <= 1000000000 &&
+        (!('currency' in data) || isValidCurrency(data.currency)) &&
+        (!('exchangeRate' in data) || (data.exchangeRate is number && data.exchangeRate > 0 && data.exchangeRate <= 10000)) &&
+        (!('convertedAmount' in data) || (data.convertedAmount is number && data.convertedAmount >= 0 && data.convertedAmount <= 10000000000)) &&
+        (!('reportingCurrency' in data) || isValidCurrency(data.reportingCurrency)) &&
+        (!('rateSource' in data) || (data.rateSource is string && data.rateSource.size() >= 1 && data.rateSource.size() <= 120)) &&
+        (!('conversionDirection' in data) || (data.conversionDirection is string && data.conversionDirection.size() >= 3 && data.conversionDirection.size() <= 20)) &&
+        (!('ratePublicationDate' in data) || isValidDateString(data.ratePublicationDate)) &&
+        (!('rateTimestamp' in data) || (data.rateTimestamp is string && data.rateTimestamp.size() >= 1 && data.rateTimestamp.size() <= 40)) &&
+        isValidDateString(data.expenseDate) &&
+        data.status in ['paid', 'pending'] &&
+        data.notes is string && data.notes.size() <= 400 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidActivity(data, tenantId) {
+      return data.ownerId is string && isValidId(data.ownerId) && data.ownerId == tenantId && data.ownerId == request.auth.uid &&
+        data.type in ['order', 'product', 'expense', 'inventory', 'customer', 'settings'] &&
+        data.title is string && data.title.size() >= 1 && data.title.size() <= 160 &&
+        data.detail is string && data.detail.size() <= 250 &&
+        data.amount is number &&
+        data.createdAt is timestamp;
+    }
+
+    function isValidProductIdea(data, tenantId) {
+      return data.ownerId is string && isValidId(data.ownerId) && data.ownerId == tenantId && data.ownerId == request.auth.uid &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 120 &&
+        data.targetPrice is number && data.targetPrice >= 0 && data.targetPrice <= 100000000 &&
+        data.estimatedCost is number && data.estimatedCost >= 0 && data.estimatedCost <= 100000000 &&
+        data.shippingEstimate is number && data.shippingEstimate >= 0 && data.shippingEstimate <= 100000000 &&
+        data.adCpaEstimate is number && data.adCpaEstimate >= 0 && data.adCpaEstimate <= 100000000 &&
+        (!('currency' in data) || isValidCurrency(data.currency)) &&
+        data.notes is string && data.notes.size() <= 500 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    match /admins/{adminUid} {
+      allow get: if isValidId(adminUid) && isVerified() && request.auth.uid == adminUid;
+      allow list, create, update, delete: if false;
+    }
+
+    match /invitations/{inviteId} {
+      allow get: if isValidSha256Id(inviteId) && (isAdmin() || isSignedIn());
+      allow list: if isAdmin();
+      allow create: if isValidSha256Id(inviteId) &&
+        isAdmin() &&
+        incoming().keys().hasAll(['id', 'codeHash', 'codePreview', 'label', 'createdByUid', 'status', 'maxUses', 'usedCount', 'expiresAt', 'createdAt', 'updatedAt']) &&
+        incoming().keys().hasOnly(['id', 'codeHash', 'codePreview', 'label', 'createdByUid', 'status', 'maxUses', 'usedCount', 'expiresAt', 'createdAt', 'updatedAt']) &&
+        isValidInvitation(incoming(), inviteId) &&
+        incoming().createdByUid == request.auth.uid &&
+        incoming().status == 'active' &&
+        incoming().usedCount == 0 &&
+        incoming().expiresAt > request.time &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isValidSha256Id(inviteId) &&
+        isValidInvitation(incoming(), inviteId) &&
+        incoming().id == existing().id &&
+        incoming().codeHash == existing().codeHash &&
+        incoming().codePreview == existing().codePreview &&
+        incoming().createdByUid == existing().createdByUid &&
+        incoming().maxUses == existing().maxUses &&
+        incoming().expiresAt == existing().expiresAt &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time && (
+          // Action: Admin revokes active invitation
+          (
+            isAdmin() &&
+            existing().status == 'active' &&
+            incoming().status == 'revoked' &&
+            incoming().usedCount == existing().usedCount &&
+            incoming().revokedAt == request.time &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'revokedAt', 'updatedAt'])
+          ) ||
+          // Action: Atomic invitation redemption paired with redemption log + tenant activation
+          (
+            isVerified() &&
+            existing().status == 'active' &&
+            existing().usedCount < existing().maxUses &&
+            existing().expiresAt > request.time &&
+            incoming().usedCount == existing().usedCount + 1 &&
+            incoming().status == (incoming().usedCount >= existing().maxUses ? 'used' : 'active') &&
+            !('revokedAt' in incoming()) &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['usedCount', 'status', 'updatedAt']) &&
+            existsAfter(/databases/$(database)/documents/invitations/$(inviteId)/redemptions/$(request.auth.uid)) &&
+            existsAfter(/databases/$(database)/documents/tenants/$(request.auth.uid))
+          )
+        );
+      allow delete: if false;
+
+      match /redemptions/{redeemerUid} {
+        allow get: if isValidSha256Id(inviteId) && isValidId(redeemerUid) && (isAdmin() || (isVerified() && request.auth.uid == redeemerUid));
+        allow list: if isValidSha256Id(inviteId) && isAdmin();
+        allow create: if isValidSha256Id(inviteId) &&
+          isValidId(redeemerUid) &&
+          isVerified() &&
+          request.auth.uid == redeemerUid &&
+          incoming().keys().hasAll(['inviteId', 'uid', 'email', 'displayName', 'provider', 'redeemedAt']) &&
+          incoming().keys().hasOnly(['inviteId', 'uid', 'email', 'displayName', 'provider', 'redeemedAt']) &&
+          isValidRedemption(incoming(), inviteId, redeemerUid) &&
+          incoming().redeemedAt == request.time &&
+          exists(/databases/$(database)/documents/invitations/$(inviteId)) &&
+          getAfter(/databases/$(database)/documents/invitations/$(inviteId)).data.usedCount == get(/databases/$(database)/documents/invitations/$(inviteId)).data.usedCount + 1 &&
+          existsAfter(/databases/$(database)/documents/tenants/$(request.auth.uid));
+        allow update, delete: if false;
+      }
+    }
+
+    match /tenants/{tenantId} {
+      allow get: if isValidId(tenantId) && isTenantOwner(tenantId) && (resource == null || !('ownerId' in existing()) || existing().ownerId == request.auth.uid);
+      allow list: if false;
+      allow create: if isValidId(tenantId) &&
+        isTenantOwner(tenantId) &&
+        incoming().keys().hasAll(['ownerId', 'businessName', 'ownerEmail', 'currency', 'taxRate', 'lowStockThreshold', 'createdAt', 'updatedAt']) &&
+        incoming().keys().hasOnly(['ownerId', 'businessName', 'ownerEmail', 'fullName', 'photoUrl', 'role', 'accountStatus', 'invitationId', 'currency', 'usdToEgpRate', 'legacyCurrency', 'language', 'exchangeRateMode', 'cbeBuyRate', 'cbeSellRate', 'cbePublicationDate', 'cbeLastSyncedAt', 'cbeSource', 'taxRate', 'lowStockThreshold', 'createdAt', 'updatedAt']) &&
+        isValidTenantProfile(incoming(), tenantId) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time && (
+          isAdmin() || (
+            'invitationId' in incoming() &&
+            isValidSha256Id(incoming().invitationId) &&
+            (!('role' in incoming()) || incoming().role == 'user') &&
+            (!('accountStatus' in incoming()) || incoming().accountStatus == 'active') &&
+            exists(/databases/$(database)/documents/invitations/$(incoming().invitationId)) &&
+            get(/databases/$(database)/documents/invitations/$(incoming().invitationId)).data.status == 'active' &&
+            get(/databases/$(database)/documents/invitations/$(incoming().invitationId)).data.usedCount < get(/databases/$(database)/documents/invitations/$(incoming().invitationId)).data.maxUses &&
+            get(/databases/$(database)/documents/invitations/$(incoming().invitationId)).data.expiresAt > request.time &&
+            getAfter(/databases/$(database)/documents/invitations/$(incoming().invitationId)).data.usedCount == get(/databases/$(database)/documents/invitations/$(incoming().invitationId)).data.usedCount + 1 &&
+            existsAfter(/databases/$(database)/documents/invitations/$(incoming().invitationId)/redemptions/$(request.auth.uid))
+          )
+        );
+      allow update: if isValidId(tenantId) &&
+        isTenantOwner(tenantId) &&
+        isValidTenantProfile(incoming(), tenantId) &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['businessName', 'ownerEmail', 'fullName', 'photoUrl', 'currency', 'usdToEgpRate', 'legacyCurrency', 'language', 'exchangeRateMode', 'cbeBuyRate', 'cbeSellRate', 'cbePublicationDate', 'cbeLastSyncedAt', 'cbeSource', 'taxRate', 'lowStockThreshold', 'updatedAt']);
+      allow delete: if false;
+
+      match /products/{productId} {
+        allow get: if isValidId(tenantId) && isValidId(productId) && isTenantOwner(tenantId) && existing().ownerId == request.auth.uid && tenantExistsAndOwned(tenantId);
+        allow list: if isTenantOwner(tenantId) && resource.data.ownerId == request.auth.uid;
+        allow create: if isValidId(tenantId) && isValidId(productId) &&
+          isTenantOwner(tenantId) &&
+          incoming().keys().hasAll(['ownerId', 'name', 'sku', 'category', 'price', 'cost', 'stock', 'status', 'imageKey', 'description', 'createdAt', 'updatedAt']) &&
+          incoming().keys().hasOnly(['ownerId', 'name', 'sku', 'category', 'price', 'cost', 'currency', 'stock', 'status', 'imageKey', 'description', 'createdAt', 'updatedAt']) &&
+          isValidProduct(incoming(), tenantId) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          tenantExistsAndOwned(tenantId);
+        allow update: if isValidId(tenantId) && isValidId(productId) &&
+          isTenantOwner(tenantId) &&
+          isValidProduct(incoming(), tenantId) &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          tenantExistsAndOwned(tenantId) && (
+            // Action: Edit product catalog details
+            incoming().diff(existing()).affectedKeys().hasOnly(['name', 'sku', 'category', 'price', 'cost', 'currency', 'stock', 'status', 'imageKey', 'description', 'updatedAt']) ||
+            // Action: Quick inventory stock adjustment
+            incoming().diff(existing()).affectedKeys().hasOnly(['stock', 'updatedAt'])
+          );
+        allow delete: if isValidId(tenantId) && isValidId(productId) && isTenantOwner(tenantId) && existing().ownerId == request.auth.uid && tenantExistsAndOwned(tenantId);
+      }
+
+      match /customers/{customerId} {
+        allow get: if isValidId(tenantId) && isValidId(customerId) && isTenantOwner(tenantId) && existing().ownerId == request.auth.uid && tenantExistsAndOwned(tenantId);
+        allow list: if isTenantOwner(tenantId) && resource.data.ownerId == request.auth.uid;
+        allow create: if isValidId(tenantId) && isValidId(customerId) &&
+          isTenantOwner(tenantId) &&
+          incoming().keys().hasAll(['ownerId', 'name', 'email', 'phone', 'location', 'notes', 'createdAt', 'updatedAt']) &&
+          incoming().keys().hasOnly(['ownerId', 'name', 'email', 'phone', 'location', 'shippingAddress', 'city', 'country', 'notes', 'createdAt', 'updatedAt']) &&
+          isValidCustomer(incoming(), tenantId) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          tenantExistsAndOwned(tenantId);
+        allow update: if isValidId(tenantId) && isValidId(customerId) &&
+          isTenantOwner(tenantId) &&
+          isValidCustomer(incoming(), tenantId) &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          tenantExistsAndOwned(tenantId) &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['name', 'email', 'phone', 'location', 'shippingAddress', 'city', 'country', 'notes', 'updatedAt']);
+        allow delete: if isValidId(tenantId) && isValidId(customerId) && isTenantOwner(tenantId) && existing().ownerId == request.auth.uid && tenantExistsAndOwned(tenantId);
+      }
+
+      match /orders/{orderId} {
+        allow get: if isValidId(tenantId) && isValidId(orderId) && isTenantOwner(tenantId) && existing().ownerId == request.auth.uid && tenantExistsAndOwned(tenantId);
+        allow list: if isTenantOwner(tenantId) && resource.data.ownerId == request.auth.uid;
+        allow create: if isValidId(tenantId) && isValidId(orderId) &&
+          isTenantOwner(tenantId) &&
+          incoming().keys().hasAll(['ownerId', 'orderNumber', 'customerId', 'customerName', 'customerEmail', 'customerPhone', 'shippingAddress', 'status', 'channel', 'subtotal', 'discountAmount', 'taxAmount', 'shippingCost', 'totalAmount', 'totalCost', 'itemCount', 'itemsSummary', 'orderDate', 'notes', 'stockDeducted', 'createdAt', 'updatedAt']) &&
+          incoming().keys().hasOnly(['ownerId', 'orderNumber', 'customerId', 'customerName', 'customerEmail', 'customerPhone', 'shippingAddress', 'status', 'channel', 'subtotal', 'discountAmount', 'taxAmount', 'shippingCost', 'totalAmount', 'totalCost', 'currency', 'exchangeRate', 'convertedAmount', 'reportingCurrency', 'rateSource', 'conversionDirection', 'ratePublicationDate', 'rateTimestamp', 'itemCount', 'itemsSummary', 'orderDate', 'notes', 'stockDeducted', 'createdAt', 'updatedAt']) &&
+          isValidOrder(incoming(), tenantId) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          tenantExistsAndOwned(tenantId);
+        allow update: if isValidId(tenantId) && isValidId(orderId) &&
+          isTenantOwner(tenantId) &&
+          isValidOrder(incoming(), tenantId) &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().orderNumber == existing().orderNumber &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          existing().status != 'cancelled' &&
+          existing().status != 'returned' &&
+          tenantExistsAndOwned(tenantId) && (
+            // Action: Advance fulfillment status or mark returned/cancelled with stock state
+            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'stockDeducted', 'updatedAt']) ||
+            // Action: Link historical order to CRM customer profile without modifying totals, items, or status
+            incoming().diff(existing()).affectedKeys().hasOnly(['customerId', 'updatedAt']) ||
+            // Action: Full order edit prior to cancelled/returned terminal states
+            incoming().diff(existing()).affectedKeys().hasOnly(['customerId', 'customerName', 'customerEmail', 'customerPhone', 'shippingAddress', 'status', 'channel', 'subtotal', 'discountAmount', 'taxAmount', 'shippingCost', 'totalAmount', 'totalCost', 'currency', 'exchangeRate', 'convertedAmount', 'reportingCurrency', 'rateSource', 'conversionDirection', 'ratePublicationDate', 'rateTimestamp', 'itemCount', 'itemsSummary', 'orderDate', 'notes', 'stockDeducted', 'updatedAt'])
+          );
+        allow delete: if isValidId(tenantId) && isValidId(orderId) && isTenantOwner(tenantId) && existing().ownerId == request.auth.uid && tenantExistsAndOwned(tenantId);
+
+        match /items/{itemId} {
+          allow get: if isValidId(tenantId) && isValidId(orderId) && isValidId(itemId) && isTenantOwner(tenantId) && existing().ownerId == request.auth.uid && tenantExistsAndOwned(tenantId);
+          allow list: if isTenantOwner(tenantId) && resource.data.ownerId == request.auth.uid;
+          allow create: if isValidId(tenantId) && isValidId(orderId) && isValidId(itemId) &&
+            isTenantOwner(tenantId) &&
+            incoming().keys().hasAll(['ownerId', 'productId', 'productName', 'sku', 'variant', 'quantity', 'unitPrice', 'unitCost', 'lineTotal']) &&
+            incoming().keys().hasOnly(['ownerId', 'productId', 'productName', 'sku', 'variant', 'quantity', 'unitPrice', 'unitCost', 'lineTotal']) &&
+            isValidOrderItem(incoming(), tenantId) &&
+            tenantExistsAndOwned(tenantId) &&
+            exists(/databases/$(database)/documents/tenants/$(tenantId)/orders/$(orderId));
+          allow update: if isValidId(tenantId) && isValidId(orderId) && isValidId(itemId) &&
+            isTenantOwner(tenantId) &&
+            isValidOrderItem(incoming(), tenantId) &&
+            incoming().ownerId == existing().ownerId &&
+            tenantExistsAndOwned(tenantId) &&
+            exists(/databases/$(database)/documents/tenants/$(tenantId)/orders/$(orderId)) &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['productId', 'productName', 'sku', 'variant', 'quantity', 'unitPrice', 'unitCost', 'lineTotal']);
+          allow delete: if isValidId(tenantId) && isValidId(orderId) && isValidId(itemId) && isTenantOwner(tenantId) && existing().ownerId == request.auth.uid && tenantExistsAndOwned(tenantId);
+        }
+
+        match /history/{historyId} {
+          allow get: if isValidId(tenantId) && isValidId(orderId) && isValidId(historyId) && isTenantOwner(tenantId) && existing().ownerId == request.auth.uid && tenantExistsAndOwned(tenantId);
+          allow list: if isTenantOwner(tenantId) && resource.data.ownerId == request.auth.uid;
+          allow create: if isValidId(tenantId) && isValidId(orderId) && isValidId(historyId) &&
+            isTenantOwner(tenantId) &&
+            incoming().keys().hasAll(['ownerId', 'status', 'title', 'detail', 'createdAt']) &&
+            incoming().keys().hasOnly(['ownerId', 'status', 'title', 'detail', 'createdAt']) &&
+            isValidOrderHistory(incoming(), tenantId) &&
+            incoming().createdAt == request.time &&
+            tenantExistsAndOwned(tenantId) &&
+            exists(/databases/$(database)/documents/tenants/$(tenantId)/orders/$(orderId));
+          allow update: if false;
+          allow delete: if isValidId(tenantId) && isValidId(orderId) && isValidId(historyId) && isTenantOwner(tenantId) && existing().ownerId == request.auth.uid && tenantExistsAndOwned(tenantId);
+        }
+      }
+
+      match /expenses/{expenseId} {
+        allow get: if isValidId(tenantId) && isValidId(expenseId) && isTenantOwner(tenantId) && existing().ownerId == request.auth.uid && tenantExistsAndOwned(tenantId);
+        allow list: if isTenantOwner(tenantId) && resource.data.ownerId == request.auth.uid;
+        allow create: if isValidId(tenantId) && isValidId(expenseId) &&
+          isTenantOwner(tenantId) &&
+          incoming().keys().hasAll(['ownerId', 'title', 'category', 'vendor', 'amount', 'expenseDate', 'status', 'notes', 'createdAt', 'updatedAt']) &&
+          incoming().keys().hasOnly(['ownerId', 'title', 'category', 'vendor', 'amount', 'currency', 'exchangeRate', 'convertedAmount', 'reportingCurrency', 'rateSource', 'conversionDirection', 'ratePublicationDate', 'rateTimestamp', 'expenseDate', 'status', 'notes', 'createdAt', 'updatedAt']) &&
+          isValidExpense(incoming(), tenantId) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          tenantExistsAndOwned(tenantId);
+        allow update: if isValidId(tenantId) && isValidId(expenseId) &&
+          isTenantOwner(tenantId) &&
+          isValidExpense(incoming(), tenantId) &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          tenantExistsAndOwned(tenantId) && (
+            // Action: Mark expense paid/pending
+            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt']) ||
+            // Action: Edit full expense entry
+            incoming().diff(existing()).affectedKeys().hasOnly(['title', 'category', 'vendor', 'amount', 'currency', 'exchangeRate', 'convertedAmount', 'reportingCurrency', 'rateSource', 'conversionDirection', 'ratePublicationDate', 'rateTimestamp', 'expenseDate', 'status', 'notes', 'updatedAt'])
+          );
+        allow delete: if isValidId(tenantId) && isValidId(expenseId) && isTenantOwner(tenantId) && existing().ownerId == request.auth.uid && tenantExistsAndOwned(tenantId);
+      }
+
+      match /activities/{activityId} {
+        allow get: if isValidId(tenantId) && isValidId(activityId) && isTenantOwner(tenantId) && existing().ownerId == request.auth.uid && tenantExistsAndOwned(tenantId);
+        allow list: if isTenantOwner(tenantId) && resource.data.ownerId == request.auth.uid;
+        allow create: if isValidId(tenantId) && isValidId(activityId) &&
+          isTenantOwner(tenantId) &&
+          incoming().keys().hasAll(['ownerId', 'type', 'title', 'detail', 'amount', 'createdAt']) &&
+          incoming().keys().hasOnly(['ownerId', 'type', 'title', 'detail', 'amount', 'createdAt']) &&
+          isValidActivity(incoming(), tenantId) &&
+          incoming().createdAt == request.time &&
+          tenantExistsAndOwned(tenantId);
+        allow update: if false;
+        allow delete: if isValidId(tenantId) && isValidId(activityId) && isTenantOwner(tenantId) && existing().ownerId == request.auth.uid && tenantExistsAndOwned(tenantId);
+      }
+
+      match /researchIdeas/{ideaId} {
+        allow get: if isValidId(tenantId) && isValidId(ideaId) && isTenantOwner(tenantId) && existing().ownerId == request.auth.uid && tenantExistsAndOwned(tenantId);
+        allow list: if isTenantOwner(tenantId) && resource.data.ownerId == request.auth.uid;
+        allow create: if isValidId(tenantId) && isValidId(ideaId) &&
+          isTenantOwner(tenantId) &&
+          incoming().keys().hasAll(['ownerId', 'name', 'targetPrice', 'estimatedCost', 'shippingEstimate', 'adCpaEstimate', 'notes', 'createdAt', 'updatedAt']) &&
+          incoming().keys().hasOnly(['ownerId', 'name', 'targetPrice', 'estimatedCost', 'shippingEstimate', 'adCpaEstimate', 'currency', 'notes', 'createdAt', 'updatedAt']) &&
+          isValidProductIdea(incoming(), tenantId) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          tenantExistsAndOwned(tenantId);
+        allow update: if isValidId(tenantId) && isValidId(ideaId) &&
+          isTenantOwner(tenantId) &&
+          isValidProductIdea(incoming(), tenantId) &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          tenantExistsAndOwned(tenantId) &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['name', 'targetPrice', 'estimatedCost', 'shippingEstimate', 'adCpaEstimate', 'currency', 'notes', 'updatedAt']);
+        allow delete: if isValidId(tenantId) && isValidId(ideaId) && isTenantOwner(tenantId) && existing().ownerId == request.auth.uid && tenantExistsAndOwned(tenantId);
+      }
+    }
+  }
+}
