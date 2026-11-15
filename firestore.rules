@@ -27,17 +27,61 @@ service cloud.firestore {
       return isSignedIn() && request.auth.token.email_verified == true;
     }
 
-    function isTenantOwner(tenantId) {
-      return isVerified() && request.auth.uid == tenantId;
-    }
-
-    function tenantExistsAndOwned(tenantId) {
-      return exists(/databases/$(database)/documents/tenants/$(tenantId)) &&
-        get(/databases/$(database)/documents/tenants/$(tenantId)).data.ownerId == request.auth.uid;
+    function isSuperAdmin() {
+      return isVerified() &&
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/admins/$(request.auth.uid)).data.role in ['super_admin', 'owner'];
     }
 
     function isAdmin() {
       return isVerified() && exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+
+    function isAccountActive() {
+      return !exists(/databases/$(database)/documents/users/$(request.auth.uid)) ||
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.accountStatus == 'active';
+    }
+
+    function isTenantOwner(tenantId) {
+      return isVerified() && request.auth.uid == tenantId;
+    }
+
+    function isTenantActive(tenantId) {
+      return exists(/databases/$(database)/documents/tenants/$(tenantId)) &&
+        (!('accountStatus' in get(/databases/$(database)/documents/tenants/$(tenantId)).data) ||
+          get(/databases/$(database)/documents/tenants/$(tenantId)).data.accountStatus == 'active');
+    }
+
+    function tenantExistsAndOwned(tenantId) {
+      return exists(/databases/$(database)/documents/tenants/$(tenantId)) &&
+        get(/databases/$(database)/documents/tenants/$(tenantId)).data.ownerId == tenantId &&
+        (!('accountStatus' in get(/databases/$(database)/documents/tenants/$(tenantId)).data) ||
+          get(/databases/$(database)/documents/tenants/$(tenantId)).data.accountStatus == 'active');
+    }
+
+    function isActiveTenantMember(tenantId) {
+      return isVerified() &&
+        isAccountActive() &&
+        exists(/databases/$(database)/documents/tenants/$(tenantId)/members/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/tenants/$(tenantId)/members/$(request.auth.uid)).data.accountStatus == 'active';
+    }
+
+    function hasMemberPermission(tenantId, section, op) {
+      return isActiveTenantMember(tenantId) &&
+        section in get(/databases/$(database)/documents/tenants/$(tenantId)/members/$(request.auth.uid)).data.permissions &&
+        op in get(/databases/$(database)/documents/tenants/$(tenantId)/members/$(request.auth.uid)).data.permissions[section] &&
+        get(/databases/$(database)/documents/tenants/$(tenantId)/members/$(request.auth.uid)).data.permissions[section][op] == true;
+    }
+
+    function canReadTenantSection(tenantId, section) {
+      return (isTenantOwner(tenantId) && isAccountActive() && isTenantActive(tenantId)) ||
+        (hasMemberPermission(tenantId, section, 'view') && isTenantActive(tenantId)) ||
+        isSuperAdmin();
+    }
+
+    function canWriteTenantSection(tenantId, section, op) {
+      return (isTenantOwner(tenantId) && isAccountActive() && tenantExistsAndOwned(tenantId)) ||
+        (hasMemberPermission(tenantId, section, op) && tenantExistsAndOwned(tenantId));
     }
 
     function isValidSha256Id(id) {
@@ -52,6 +96,82 @@ service cloud.firestore {
       return val in ['USD', 'EGP', 'EUR', 'GBP', 'CAD', 'AUD'];
     }
 
+    function isValidSectionPermEntry(entry) {
+      return entry is map &&
+        entry.keys().hasAll(['view', 'create', 'edit', 'delete']) &&
+        entry.keys().hasOnly(['view', 'create', 'edit', 'delete']) &&
+        entry.view is bool &&
+        entry.create is bool &&
+        entry.edit is bool &&
+        entry.delete is bool;
+    }
+
+    function isValidPermissionsMap(perms) {
+      return perms is map &&
+        perms.keys().hasAll(['products', 'orders', 'customers', 'inventory', 'finance', 'marketing', 'reports', 'settings']) &&
+        perms.keys().hasOnly(['products', 'orders', 'customers', 'inventory', 'finance', 'marketing', 'reports', 'settings']) &&
+        isValidSectionPermEntry(perms.products) &&
+        isValidSectionPermEntry(perms.orders) &&
+        isValidSectionPermEntry(perms.customers) &&
+        isValidSectionPermEntry(perms.inventory) &&
+        isValidSectionPermEntry(perms.finance) &&
+        isValidSectionPermEntry(perms.marketing) &&
+        isValidSectionPermEntry(perms.reports) &&
+        isValidSectionPermEntry(perms.settings);
+    }
+
+    function isValidUserProfile(data, userId) {
+      return data.uid is string && isValidId(data.uid) && data.uid == userId &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 160 &&
+        data.fullName is string && data.fullName.size() <= 120 &&
+        (!('photoUrl' in data) || (data.photoUrl is string && data.photoUrl.size() <= 500)) &&
+        data.role in ['super_admin', 'store_owner', 'manager', 'staff', 'viewer'] &&
+        data.accountStatus in ['active', 'suspended'] &&
+        (!('tenantId' in data) || data.tenantId == null || (data.tenantId is string && data.tenantId.size() <= 128)) &&
+        (!('businessName' in data) || (data.businessName is string && data.businessName.size() <= 100)) &&
+        isValidPermissionsMap(data.permissions) &&
+        (!('invitationId' in data) || isValidSha256Id(data.invitationId)) &&
+        (!('createdByUid' in data) || (data.createdByUid is string && isValidId(data.createdByUid))) &&
+        data.createdAt is timestamp &&
+        (!('lastActiveAt' in data) || data.lastActiveAt is timestamp) &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidTenantMember(data, tenantId, memberUid) {
+      return data.uid is string && isValidId(data.uid) && data.uid == memberUid &&
+        data.tenantId is string && isValidId(data.tenantId) && data.tenantId == tenantId &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 160 &&
+        data.fullName is string && data.fullName.size() <= 120 &&
+        data.role in ['manager', 'staff', 'viewer'] &&
+        data.accountStatus in ['active', 'suspended'] &&
+        isValidPermissionsMap(data.permissions) &&
+        (!('invitedByUid' in data) || (data.invitedByUid is string && isValidId(data.invitedByUid))) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidRoleTemplate(data, roleId) {
+      return data.role is string && data.role == roleId &&
+        data.role in ['super_admin', 'store_owner', 'manager', 'staff', 'viewer'] &&
+        data.label is string && data.label.size() >= 1 && data.label.size() <= 80 &&
+        data.description is string && data.description.size() <= 240 &&
+        isValidPermissionsMap(data.permissions) &&
+        (!('updatedByUid' in data) || (data.updatedByUid is string && isValidId(data.updatedByUid))) &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidAuditLog(data, logId) {
+      return data.id is string && isValidId(data.id) && data.id == logId &&
+        data.actorUid is string && isValidId(data.actorUid) &&
+        data.actorEmail is string && data.actorEmail.size() >= 3 && data.actorEmail.size() <= 160 &&
+        data.action is string && data.action.size() >= 2 && data.action.size() <= 80 &&
+        data.targetType in ['user', 'tenant', 'invitation', 'role_template', 'system'] &&
+        data.targetId is string && data.targetId.size() >= 1 && data.targetId.size() <= 128 &&
+        data.targetLabel is string && data.targetLabel.size() <= 160 &&
+        data.details is string && data.details.size() <= 500 &&
+        data.createdAt is timestamp;
+    }
+
     function isValidInvitation(data, inviteId) {
       return data.id is string && isValidSha256Id(data.id) && data.id == inviteId &&
         data.codeHash is string && isValidSha256Id(data.codeHash) && data.codeHash == inviteId &&
@@ -61,6 +181,14 @@ service cloud.firestore {
         data.status in ['active', 'used', 'revoked'] &&
         data.maxUses is int && data.maxUses >= 1 && data.maxUses <= 100 &&
         data.usedCount is int && data.usedCount >= 0 && data.usedCount <= data.maxUses &&
+        (!('targetEmail' in data) || (data.targetEmail is string && data.targetEmail.size() <= 160)) &&
+        (!('targetFullName' in data) || (data.targetFullName is string && data.targetFullName.size() <= 120)) &&
+        (!('targetBusinessName' in data) || (data.targetBusinessName is string && data.targetBusinessName.size() <= 100)) &&
+        (!('targetRole' in data) || data.targetRole in ['store_owner', 'manager', 'staff', 'viewer']) &&
+        (!('targetTenantId' in data) || (data.targetTenantId is string && data.targetTenantId.size() <= 128)) &&
+        (!('targetPermissions' in data) || isValidPermissionsMap(data.targetPermissions)) &&
+        (!('resendCount' in data) || (data.resendCount is int && data.resendCount >= 0 && data.resendCount <= 1000)) &&
+        (!('lastSentAt' in data) || data.lastSentAt is timestamp) &&
         data.expiresAt is timestamp &&
         data.createdAt is timestamp &&
         data.updatedAt is timestamp &&
@@ -77,12 +205,12 @@ service cloud.firestore {
     }
 
     function isValidTenantProfile(data, tenantId) {
-      return data.ownerId is string && isValidId(data.ownerId) && data.ownerId == tenantId && data.ownerId == request.auth.uid &&
+      return data.ownerId is string && isValidId(data.ownerId) && data.ownerId == tenantId &&
         data.businessName is string && data.businessName.size() >= 1 && data.businessName.size() <= 100 &&
         data.ownerEmail is string && data.ownerEmail.size() >= 3 && data.ownerEmail.size() <= 160 &&
         (!('fullName' in data) || (data.fullName is string && data.fullName.size() <= 120)) &&
         (!('photoUrl' in data) || (data.photoUrl is string && data.photoUrl.size() <= 500)) &&
-        (!('role' in data) || data.role in ['owner', 'admin', 'user']) &&
+        (!('role' in data) || data.role in ['super_admin', 'store_owner', 'manager', 'staff', 'viewer', 'owner', 'admin', 'user']) &&
         (!('accountStatus' in data) || data.accountStatus in ['active', 'suspended']) &&
         (!('invitationId' in data) || isValidSha256Id(data.invitationId)) &&
         isValidCurrency(data.currency) &&
@@ -102,7 +230,7 @@ service cloud.firestore {
     }
 
     function isValidProduct(data, tenantId) {
-      return data.ownerId is string && isValidId(data.ownerId) && data.ownerId == tenantId && data.ownerId == request.auth.uid &&
+      return data.ownerId is string && isValidId(data.ownerId) && data.ownerId == tenantId &&
         data.name is string && data.name.size() >= 1 && data.name.size() <= 120 &&
         data.sku is string && data.sku.size() >= 1 && data.sku.size() <= 40 &&
         data.category is string && data.category.size() >= 1 && data.category.size() <= 60 &&
@@ -118,7 +246,7 @@ service cloud.firestore {
     }
 
     function isValidCustomer(data, tenantId) {
-      return data.ownerId is string && isValidId(data.ownerId) && data.ownerId == tenantId && data.ownerId == request.auth.uid &&
+      return data.ownerId is string && isValidId(data.ownerId) && data.ownerId == tenantId &&
         data.name is string && data.name.size() >= 1 && data.name.size() <= 120 &&
         data.email is string && data.email.size() <= 160 &&
         data.phone is string && data.phone.size() <= 40 &&
@@ -132,7 +260,7 @@ service cloud.firestore {
     }
 
     function isValidOrder(data, tenantId) {
-      return data.ownerId is string && isValidId(data.ownerId) && data.ownerId == tenantId && data.ownerId == request.auth.uid &&
+      return data.ownerId is string && isValidId(data.ownerId) && data.ownerId == tenantId &&
         data.orderNumber is string && data.orderNumber.size() >= 1 && data.orderNumber.size() <= 40 &&
         data.customerId is string && isValidId(data.customerId) &&
         data.customerName is string && data.customerName.size() >= 1 && data.customerName.size() <= 120 &&
@@ -165,7 +293,7 @@ service cloud.firestore {
     }
 
     function isValidOrderItem(data, tenantId) {
-      return data.ownerId is string && isValidId(data.ownerId) && data.ownerId == tenantId && data.ownerId == request.auth.uid &&
+      return data.ownerId is string && isValidId(data.ownerId) && data.ownerId == tenantId &&
         data.productId is string && isValidId(data.productId) &&
         data.productName is string && data.productName.size() >= 1 && data.productName.size() <= 120 &&
         data.sku is string && data.sku.size() >= 1 && data.sku.size() <= 40 &&
@@ -177,7 +305,7 @@ service cloud.firestore {
     }
 
     function isValidOrderHistory(data, tenantId) {
-      return data.ownerId is string && isValidId(data.ownerId) && data.ownerId == tenantId && data.ownerId == request.auth.uid &&
+      return data.ownerId is string && isValidId(data.ownerId) && data.ownerId == tenantId &&
         data.status in ['pending', 'processing', 'shipped', 'delivered', 'cancelled', 'returned'] &&
         data.title is string && data.title.size() >= 1 && data.title.size() <= 160 &&
         data.detail is string && data.detail.size() <= 300 &&
@@ -185,7 +313,7 @@ service cloud.firestore {
     }
 
     function isValidExpense(data, tenantId) {
-      return data.ownerId is string && isValidId(data.ownerId) && data.ownerId == tenantId && data.ownerId == request.auth.uid &&
+      return data.ownerId is string && isValidId(data.ownerId) && data.ownerId == tenantId &&
         data.title is string && data.title.size() >= 1 && data.title.size() <= 120 &&
         data.category in ['Marketing', 'Shipping', 'Packaging', 'Software', 'Operations', 'Other', 'Inventory', 'Payroll'] &&
         data.vendor is string && data.vendor.size() >= 1 && data.vendor.size() <= 100 &&
@@ -206,7 +334,7 @@ service cloud.firestore {
     }
 
     function isValidActivity(data, tenantId) {
-      return data.ownerId is string && isValidId(data.ownerId) && data.ownerId == tenantId && data.ownerId == request.auth.uid &&
+      return data.ownerId is string && isValidId(data.ownerId) && data.ownerId == tenantId &&
         data.type in ['order', 'product', 'expense', 'inventory', 'customer', 'settings'] &&
         data.title is string && data.title.size() >= 1 && data.title.size() <= 160 &&
         data.detail is string && data.detail.size() <= 250 &&
@@ -215,7 +343,7 @@ service cloud.firestore {
     }
 
     function isValidProductIdea(data, tenantId) {
-      return data.ownerId is string && isValidId(data.ownerId) && data.ownerId == tenantId && data.ownerId == request.auth.uid &&
+      return data.ownerId is string && isValidId(data.ownerId) && data.ownerId == tenantId &&
         data.name is string && data.name.size() >= 1 && data.name.size() <= 120 &&
         data.targetPrice is number && data.targetPrice >= 0 && data.targetPrice <= 100000000 &&
         data.estimatedCost is number && data.estimatedCost >= 0 && data.estimatedCost <= 100000000 &&
@@ -232,13 +360,97 @@ service cloud.firestore {
       allow list, create, update, delete: if false;
     }
 
+    match /users/{userId} {
+      allow get: if isValidId(userId) && isVerified() && (request.auth.uid == userId || isSuperAdmin());
+      allow list: if isSuperAdmin();
+      allow create: if isValidId(userId) &&
+        isVerified() &&
+        incoming().keys().hasAll(['uid', 'email', 'fullName', 'role', 'accountStatus', 'permissions', 'createdAt', 'updatedAt']) &&
+        incoming().keys().hasOnly(['uid', 'email', 'fullName', 'photoUrl', 'role', 'accountStatus', 'tenantId', 'businessName', 'permissions', 'invitationId', 'createdByUid', 'createdAt', 'lastActiveAt', 'updatedAt']) &&
+        isValidUserProfile(incoming(), userId) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time && (
+          (isSuperAdmin() && incoming().role in ['store_owner', 'manager', 'staff', 'viewer']) ||
+          (
+            request.auth.uid == userId &&
+            incoming().accountStatus == 'active' &&
+            incoming().role in ['store_owner', 'manager', 'staff', 'viewer'] &&
+            (
+              // Existing store owner creating own user profile record matching own tenant
+              (incoming().role == 'store_owner' && incoming().tenantId == request.auth.uid && exists(/databases/$(database)/documents/tenants/$(request.auth.uid))) ||
+              // Atomic invitation redemption
+              (
+                'invitationId' in incoming() &&
+                isValidSha256Id(incoming().invitationId) &&
+                exists(/databases/$(database)/documents/invitations/$(incoming().invitationId))
+              )
+            )
+          )
+        );
+      allow update: if isValidId(userId) &&
+        isVerified() &&
+        isValidUserProfile(incoming(), userId) &&
+        incoming().uid == existing().uid &&
+        incoming().email == existing().email &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time && (
+          // Self-update strictly restricted to non-RBAC metadata and lastActiveAt
+          (
+            request.auth.uid == userId &&
+            incoming().role == existing().role &&
+            incoming().accountStatus == existing().accountStatus &&
+            incoming().permissions == existing().permissions &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['fullName', 'photoUrl', 'lastActiveAt', 'updatedAt'])
+          ) ||
+          // Super Admin management (cannot self-demote or elevate another account to super_admin)
+          (
+            isSuperAdmin() &&
+            request.auth.uid != userId &&
+            incoming().role in ['store_owner', 'manager', 'staff', 'viewer'] &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['fullName', 'photoUrl', 'role', 'accountStatus', 'tenantId', 'businessName', 'permissions', 'updatedAt'])
+          )
+        );
+      allow delete: if isValidId(userId) && isSuperAdmin() && request.auth.uid != userId;
+    }
+
+    match /roleTemplates/{roleId} {
+      allow get: if isVerified() && roleId in ['super_admin', 'store_owner', 'manager', 'staff', 'viewer'];
+      allow list: if isSuperAdmin();
+      allow create: if isSuperAdmin() &&
+        roleId in ['store_owner', 'manager', 'staff', 'viewer'] &&
+        incoming().keys().hasAll(['role', 'label', 'description', 'permissions', 'updatedAt']) &&
+        incoming().keys().hasOnly(['role', 'label', 'description', 'permissions', 'updatedByUid', 'updatedAt']) &&
+        isValidRoleTemplate(incoming(), roleId) &&
+        incoming().updatedAt == request.time;
+      allow update: if isSuperAdmin() &&
+        roleId in ['store_owner', 'manager', 'staff', 'viewer'] &&
+        isValidRoleTemplate(incoming(), roleId) &&
+        incoming().role == existing().role &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['label', 'description', 'permissions', 'updatedByUid', 'updatedAt']);
+      allow delete: if false;
+    }
+
+    match /adminAuditLogs/{logId} {
+      allow get: if isValidId(logId) && isSuperAdmin();
+      allow list: if isSuperAdmin();
+      allow create: if isValidId(logId) &&
+        isSuperAdmin() &&
+        incoming().keys().hasAll(['id', 'actorUid', 'actorEmail', 'action', 'targetType', 'targetId', 'targetLabel', 'details', 'createdAt']) &&
+        incoming().keys().hasOnly(['id', 'actorUid', 'actorEmail', 'action', 'targetType', 'targetId', 'targetLabel', 'details', 'createdAt']) &&
+        isValidAuditLog(incoming(), logId) &&
+        incoming().actorUid == request.auth.uid &&
+        incoming().createdAt == request.time;
+      allow update, delete: if false;
+    }
+
     match /invitations/{inviteId} {
       allow get: if isValidSha256Id(inviteId) && (isAdmin() || isSignedIn());
       allow list: if isAdmin();
       allow create: if isValidSha256Id(inviteId) &&
         isAdmin() &&
         incoming().keys().hasAll(['id', 'codeHash', 'codePreview', 'label', 'createdByUid', 'status', 'maxUses', 'usedCount', 'expiresAt', 'createdAt', 'updatedAt']) &&
-        incoming().keys().hasOnly(['id', 'codeHash', 'codePreview', 'label', 'createdByUid', 'status', 'maxUses', 'usedCount', 'expiresAt', 'createdAt', 'updatedAt']) &&
+        incoming().keys().hasOnly(['id', 'codeHash', 'codePreview', 'label', 'createdByUid', 'status', 'maxUses', 'usedCount', 'targetEmail', 'targetFullName', 'targetBusinessName', 'targetRole', 'targetTenantId', 'targetPermissions', 'resendCount', 'lastSentAt', 'expiresAt', 'createdAt', 'updatedAt']) &&
         isValidInvitation(incoming(), inviteId) &&
         incoming().createdByUid == request.auth.uid &&
         incoming().status == 'active' &&
@@ -265,18 +477,29 @@ service cloud.firestore {
             incoming().revokedAt == request.time &&
             incoming().diff(existing()).affectedKeys().hasOnly(['status', 'revokedAt', 'updatedAt'])
           ) ||
-          // Action: Atomic invitation redemption paired with redemption log + tenant activation
+          // Action: Admin marks invitation as resent
+          (
+            isAdmin() &&
+            existing().status == 'active' &&
+            incoming().status == 'active' &&
+            incoming().usedCount == existing().usedCount &&
+            incoming().lastSentAt == request.time &&
+            !('revokedAt' in incoming()) &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['resendCount', 'lastSentAt', 'updatedAt'])
+          ) ||
+          // Action: Atomic invitation redemption paired with redemption log + user/tenant activation
           (
             isVerified() &&
             existing().status == 'active' &&
             existing().usedCount < existing().maxUses &&
             existing().expiresAt > request.time &&
+            (!('targetEmail' in existing()) || existing().targetEmail == '' || existing().targetEmail == request.auth.token.email) &&
             incoming().usedCount == existing().usedCount + 1 &&
             incoming().status == (incoming().usedCount >= existing().maxUses ? 'used' : 'active') &&
             !('revokedAt' in incoming()) &&
             incoming().diff(existing()).affectedKeys().hasOnly(['usedCount', 'status', 'updatedAt']) &&
             existsAfter(/databases/$(database)/documents/invitations/$(inviteId)/redemptions/$(request.auth.uid)) &&
-            existsAfter(/databases/$(database)/documents/tenants/$(request.auth.uid))
+            existsAfter(/databases/$(database)/documents/users/$(request.auth.uid))
           )
         );
       allow delete: if false;
@@ -293,17 +516,21 @@ service cloud.firestore {
           isValidRedemption(incoming(), inviteId, redeemerUid) &&
           incoming().redeemedAt == request.time &&
           exists(/databases/$(database)/documents/invitations/$(inviteId)) &&
-          getAfter(/databases/$(database)/documents/invitations/$(inviteId)).data.usedCount == get(/databases/$(database)/documents/invitations/$(inviteId)).data.usedCount + 1 &&
-          existsAfter(/databases/$(database)/documents/tenants/$(request.auth.uid));
+          getAfter(/databases/$(database)/documents/invitations/$(inviteId)).data.usedCount == get(/databases/$(database)/documents/invitations/$(inviteId)).data.usedCount + 1;
         allow update, delete: if false;
       }
     }
 
     match /tenants/{tenantId} {
-      allow get: if isValidId(tenantId) && isTenantOwner(tenantId) && (resource == null || !('ownerId' in existing()) || existing().ownerId == request.auth.uid);
-      allow list: if false;
+      allow get: if isValidId(tenantId) && (
+        (isTenantOwner(tenantId) && (resource == null || !('ownerId' in existing()) || existing().ownerId == request.auth.uid)) ||
+        isActiveTenantMember(tenantId) ||
+        isSuperAdmin()
+      );
+      allow list: if isSuperAdmin();
       allow create: if isValidId(tenantId) &&
         isTenantOwner(tenantId) &&
+        incoming().ownerId == request.auth.uid &&
         incoming().keys().hasAll(['ownerId', 'businessName', 'ownerEmail', 'currency', 'taxRate', 'lowStockThreshold', 'createdAt', 'updatedAt']) &&
         incoming().keys().hasOnly(['ownerId', 'businessName', 'ownerEmail', 'fullName', 'photoUrl', 'role', 'accountStatus', 'invitationId', 'currency', 'usdToEgpRate', 'legacyCurrency', 'language', 'exchangeRateMode', 'cbeBuyRate', 'cbeSellRate', 'cbePublicationDate', 'cbeLastSyncedAt', 'cbeSource', 'taxRate', 'lowStockThreshold', 'createdAt', 'updatedAt']) &&
         isValidTenantProfile(incoming(), tenantId) &&
@@ -312,7 +539,7 @@ service cloud.firestore {
           isAdmin() || (
             'invitationId' in incoming() &&
             isValidSha256Id(incoming().invitationId) &&
-            (!('role' in incoming()) || incoming().role == 'user') &&
+            (!('role' in incoming()) || incoming().role in ['store_owner', 'user']) &&
             (!('accountStatus' in incoming()) || incoming().accountStatus == 'active') &&
             exists(/databases/$(database)/documents/invitations/$(incoming().invitationId)) &&
             get(/databases/$(database)/documents/invitations/$(incoming().invitationId)).data.status == 'active' &&
@@ -323,188 +550,204 @@ service cloud.firestore {
           )
         );
       allow update: if isValidId(tenantId) &&
-        isTenantOwner(tenantId) &&
         isValidTenantProfile(incoming(), tenantId) &&
         incoming().ownerId == existing().ownerId &&
         incoming().createdAt == existing().createdAt &&
-        incoming().updatedAt == request.time &&
-        incoming().diff(existing()).affectedKeys().hasOnly(['businessName', 'ownerEmail', 'fullName', 'photoUrl', 'currency', 'usdToEgpRate', 'legacyCurrency', 'language', 'exchangeRateMode', 'cbeBuyRate', 'cbeSellRate', 'cbePublicationDate', 'cbeLastSyncedAt', 'cbeSource', 'taxRate', 'lowStockThreshold', 'updatedAt']);
+        incoming().updatedAt == request.time && (
+          (
+            (isTenantOwner(tenantId) || hasMemberPermission(tenantId, 'settings', 'edit')) &&
+            isAccountActive() &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['businessName', 'ownerEmail', 'fullName', 'photoUrl', 'currency', 'usdToEgpRate', 'legacyCurrency', 'language', 'exchangeRateMode', 'cbeBuyRate', 'cbeSellRate', 'cbePublicationDate', 'cbeLastSyncedAt', 'cbeSource', 'taxRate', 'lowStockThreshold', 'updatedAt'])
+          ) ||
+          (
+            isSuperAdmin() &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['accountStatus', 'businessName', 'updatedAt'])
+          )
+        );
       allow delete: if false;
 
+      match /members/{memberUid} {
+        allow get: if isValidId(tenantId) && isValidId(memberUid) && (
+          isTenantOwner(tenantId) ||
+          (isVerified() && request.auth.uid == memberUid) ||
+          isSuperAdmin()
+        );
+        allow list: if isValidId(tenantId) && (isTenantOwner(tenantId) || isSuperAdmin());
+        allow create: if isValidId(tenantId) && isValidId(memberUid) &&
+          incoming().keys().hasAll(['uid', 'tenantId', 'email', 'fullName', 'role', 'accountStatus', 'permissions', 'createdAt', 'updatedAt']) &&
+          incoming().keys().hasOnly(['uid', 'tenantId', 'email', 'fullName', 'role', 'accountStatus', 'permissions', 'invitedByUid', 'createdAt', 'updatedAt']) &&
+          isValidTenantMember(incoming(), tenantId, memberUid) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time && (
+            isSuperAdmin() ||
+            isTenantOwner(tenantId) ||
+            (isVerified() && request.auth.uid == memberUid && existsAfter(/databases/$(database)/documents/users/$(request.auth.uid)))
+          );
+        allow update: if isValidId(tenantId) && isValidId(memberUid) &&
+          (isSuperAdmin() || isTenantOwner(tenantId)) &&
+          isValidTenantMember(incoming(), tenantId, memberUid) &&
+          incoming().uid == existing().uid &&
+          incoming().tenantId == existing().tenantId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['fullName', 'role', 'accountStatus', 'permissions', 'updatedAt']);
+        allow delete: if isValidId(tenantId) && isValidId(memberUid) && (isSuperAdmin() || isTenantOwner(tenantId));
+      }
+
       match /products/{productId} {
-        allow get: if isValidId(tenantId) && isValidId(productId) && isTenantOwner(tenantId) && existing().ownerId == request.auth.uid && tenantExistsAndOwned(tenantId);
-        allow list: if isTenantOwner(tenantId) && resource.data.ownerId == request.auth.uid;
+        allow get: if isValidId(tenantId) && isValidId(productId) && canReadTenantSection(tenantId, 'products') && existing().ownerId == tenantId;
+        allow list: if isVerified() && resource.data.ownerId == tenantId && (request.auth.uid == tenantId || isActiveTenantMember(tenantId) || isSuperAdmin());
         allow create: if isValidId(tenantId) && isValidId(productId) &&
-          isTenantOwner(tenantId) &&
+          canWriteTenantSection(tenantId, 'products', 'create') &&
           incoming().keys().hasAll(['ownerId', 'name', 'sku', 'category', 'price', 'cost', 'stock', 'status', 'imageKey', 'description', 'createdAt', 'updatedAt']) &&
           incoming().keys().hasOnly(['ownerId', 'name', 'sku', 'category', 'price', 'cost', 'currency', 'stock', 'status', 'imageKey', 'description', 'createdAt', 'updatedAt']) &&
           isValidProduct(incoming(), tenantId) &&
           incoming().createdAt == request.time &&
-          incoming().updatedAt == request.time &&
-          tenantExistsAndOwned(tenantId);
+          incoming().updatedAt == request.time;
         allow update: if isValidId(tenantId) && isValidId(productId) &&
-          isTenantOwner(tenantId) &&
           isValidProduct(incoming(), tenantId) &&
           incoming().ownerId == existing().ownerId &&
           incoming().createdAt == existing().createdAt &&
-          incoming().updatedAt == request.time &&
-          tenantExistsAndOwned(tenantId) && (
-            // Action: Edit product catalog details
-            incoming().diff(existing()).affectedKeys().hasOnly(['name', 'sku', 'category', 'price', 'cost', 'currency', 'stock', 'status', 'imageKey', 'description', 'updatedAt']) ||
-            // Action: Quick inventory stock adjustment
-            incoming().diff(existing()).affectedKeys().hasOnly(['stock', 'updatedAt'])
+          incoming().updatedAt == request.time && (
+            (canWriteTenantSection(tenantId, 'products', 'edit') && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'sku', 'category', 'price', 'cost', 'currency', 'stock', 'status', 'imageKey', 'description', 'updatedAt'])) ||
+            ((canWriteTenantSection(tenantId, 'inventory', 'edit') || canWriteTenantSection(tenantId, 'orders', 'create') || canWriteTenantSection(tenantId, 'orders', 'edit')) && incoming().diff(existing()).affectedKeys().hasOnly(['stock', 'updatedAt']))
           );
-        allow delete: if isValidId(tenantId) && isValidId(productId) && isTenantOwner(tenantId) && existing().ownerId == request.auth.uid && tenantExistsAndOwned(tenantId);
+        allow delete: if isValidId(tenantId) && isValidId(productId) && canWriteTenantSection(tenantId, 'products', 'delete') && existing().ownerId == tenantId;
       }
 
       match /customers/{customerId} {
-        allow get: if isValidId(tenantId) && isValidId(customerId) && isTenantOwner(tenantId) && existing().ownerId == request.auth.uid && tenantExistsAndOwned(tenantId);
-        allow list: if isTenantOwner(tenantId) && resource.data.ownerId == request.auth.uid;
+        allow get: if isValidId(tenantId) && isValidId(customerId) && canReadTenantSection(tenantId, 'customers') && existing().ownerId == tenantId;
+        allow list: if isVerified() && resource.data.ownerId == tenantId && (request.auth.uid == tenantId || isActiveTenantMember(tenantId) || isSuperAdmin());
         allow create: if isValidId(tenantId) && isValidId(customerId) &&
-          isTenantOwner(tenantId) &&
+          canWriteTenantSection(tenantId, 'customers', 'create') &&
           incoming().keys().hasAll(['ownerId', 'name', 'email', 'phone', 'location', 'notes', 'createdAt', 'updatedAt']) &&
           incoming().keys().hasOnly(['ownerId', 'name', 'email', 'phone', 'location', 'shippingAddress', 'city', 'country', 'notes', 'createdAt', 'updatedAt']) &&
           isValidCustomer(incoming(), tenantId) &&
           incoming().createdAt == request.time &&
-          incoming().updatedAt == request.time &&
-          tenantExistsAndOwned(tenantId);
+          incoming().updatedAt == request.time;
         allow update: if isValidId(tenantId) && isValidId(customerId) &&
-          isTenantOwner(tenantId) &&
+          canWriteTenantSection(tenantId, 'customers', 'edit') &&
           isValidCustomer(incoming(), tenantId) &&
           incoming().ownerId == existing().ownerId &&
           incoming().createdAt == existing().createdAt &&
           incoming().updatedAt == request.time &&
-          tenantExistsAndOwned(tenantId) &&
           incoming().diff(existing()).affectedKeys().hasOnly(['name', 'email', 'phone', 'location', 'shippingAddress', 'city', 'country', 'notes', 'updatedAt']);
-        allow delete: if isValidId(tenantId) && isValidId(customerId) && isTenantOwner(tenantId) && existing().ownerId == request.auth.uid && tenantExistsAndOwned(tenantId);
+        allow delete: if isValidId(tenantId) && isValidId(customerId) && canWriteTenantSection(tenantId, 'customers', 'delete') && existing().ownerId == tenantId;
       }
 
       match /orders/{orderId} {
-        allow get: if isValidId(tenantId) && isValidId(orderId) && isTenantOwner(tenantId) && existing().ownerId == request.auth.uid && tenantExistsAndOwned(tenantId);
-        allow list: if isTenantOwner(tenantId) && resource.data.ownerId == request.auth.uid;
+        allow get: if isValidId(tenantId) && isValidId(orderId) && canReadTenantSection(tenantId, 'orders') && existing().ownerId == tenantId;
+        allow list: if isVerified() && resource.data.ownerId == tenantId && (request.auth.uid == tenantId || isActiveTenantMember(tenantId) || isSuperAdmin());
         allow create: if isValidId(tenantId) && isValidId(orderId) &&
-          isTenantOwner(tenantId) &&
+          canWriteTenantSection(tenantId, 'orders', 'create') &&
           incoming().keys().hasAll(['ownerId', 'orderNumber', 'customerId', 'customerName', 'customerEmail', 'customerPhone', 'shippingAddress', 'status', 'channel', 'subtotal', 'discountAmount', 'taxAmount', 'shippingCost', 'totalAmount', 'totalCost', 'itemCount', 'itemsSummary', 'orderDate', 'notes', 'stockDeducted', 'createdAt', 'updatedAt']) &&
           incoming().keys().hasOnly(['ownerId', 'orderNumber', 'customerId', 'customerName', 'customerEmail', 'customerPhone', 'shippingAddress', 'status', 'channel', 'subtotal', 'discountAmount', 'taxAmount', 'shippingCost', 'totalAmount', 'totalCost', 'currency', 'exchangeRate', 'convertedAmount', 'reportingCurrency', 'rateSource', 'conversionDirection', 'ratePublicationDate', 'rateTimestamp', 'itemCount', 'itemsSummary', 'orderDate', 'notes', 'stockDeducted', 'createdAt', 'updatedAt']) &&
           isValidOrder(incoming(), tenantId) &&
           incoming().createdAt == request.time &&
-          incoming().updatedAt == request.time &&
-          tenantExistsAndOwned(tenantId);
+          incoming().updatedAt == request.time;
         allow update: if isValidId(tenantId) && isValidId(orderId) &&
-          isTenantOwner(tenantId) &&
+          canWriteTenantSection(tenantId, 'orders', 'edit') &&
           isValidOrder(incoming(), tenantId) &&
           incoming().ownerId == existing().ownerId &&
           incoming().orderNumber == existing().orderNumber &&
           incoming().createdAt == existing().createdAt &&
           incoming().updatedAt == request.time &&
           existing().status != 'cancelled' &&
-          existing().status != 'returned' &&
-          tenantExistsAndOwned(tenantId) && (
-            // Action: Advance fulfillment status or mark returned/cancelled with stock state
+          existing().status != 'returned' && (
             incoming().diff(existing()).affectedKeys().hasOnly(['status', 'stockDeducted', 'updatedAt']) ||
-            // Action: Link historical order to CRM customer profile without modifying totals, items, or status
             incoming().diff(existing()).affectedKeys().hasOnly(['customerId', 'updatedAt']) ||
-            // Action: Full order edit prior to cancelled/returned terminal states
             incoming().diff(existing()).affectedKeys().hasOnly(['customerId', 'customerName', 'customerEmail', 'customerPhone', 'shippingAddress', 'status', 'channel', 'subtotal', 'discountAmount', 'taxAmount', 'shippingCost', 'totalAmount', 'totalCost', 'currency', 'exchangeRate', 'convertedAmount', 'reportingCurrency', 'rateSource', 'conversionDirection', 'ratePublicationDate', 'rateTimestamp', 'itemCount', 'itemsSummary', 'orderDate', 'notes', 'stockDeducted', 'updatedAt'])
           );
-        allow delete: if isValidId(tenantId) && isValidId(orderId) && isTenantOwner(tenantId) && existing().ownerId == request.auth.uid && tenantExistsAndOwned(tenantId);
+        allow delete: if isValidId(tenantId) && isValidId(orderId) && canWriteTenantSection(tenantId, 'orders', 'delete') && existing().ownerId == tenantId;
 
         match /items/{itemId} {
-          allow get: if isValidId(tenantId) && isValidId(orderId) && isValidId(itemId) && isTenantOwner(tenantId) && existing().ownerId == request.auth.uid && tenantExistsAndOwned(tenantId);
-          allow list: if isTenantOwner(tenantId) && resource.data.ownerId == request.auth.uid;
+          allow get: if isValidId(tenantId) && isValidId(orderId) && isValidId(itemId) && canReadTenantSection(tenantId, 'orders') && existing().ownerId == tenantId;
+          allow list: if isVerified() && resource.data.ownerId == tenantId && (request.auth.uid == tenantId || isActiveTenantMember(tenantId) || isSuperAdmin());
           allow create: if isValidId(tenantId) && isValidId(orderId) && isValidId(itemId) &&
-            isTenantOwner(tenantId) &&
+            canWriteTenantSection(tenantId, 'orders', 'create') &&
             incoming().keys().hasAll(['ownerId', 'productId', 'productName', 'sku', 'variant', 'quantity', 'unitPrice', 'unitCost', 'lineTotal']) &&
             incoming().keys().hasOnly(['ownerId', 'productId', 'productName', 'sku', 'variant', 'quantity', 'unitPrice', 'unitCost', 'lineTotal']) &&
             isValidOrderItem(incoming(), tenantId) &&
-            tenantExistsAndOwned(tenantId) &&
             exists(/databases/$(database)/documents/tenants/$(tenantId)/orders/$(orderId));
           allow update: if isValidId(tenantId) && isValidId(orderId) && isValidId(itemId) &&
-            isTenantOwner(tenantId) &&
+            canWriteTenantSection(tenantId, 'orders', 'edit') &&
             isValidOrderItem(incoming(), tenantId) &&
             incoming().ownerId == existing().ownerId &&
-            tenantExistsAndOwned(tenantId) &&
             exists(/databases/$(database)/documents/tenants/$(tenantId)/orders/$(orderId)) &&
             incoming().diff(existing()).affectedKeys().hasOnly(['productId', 'productName', 'sku', 'variant', 'quantity', 'unitPrice', 'unitCost', 'lineTotal']);
-          allow delete: if isValidId(tenantId) && isValidId(orderId) && isValidId(itemId) && isTenantOwner(tenantId) && existing().ownerId == request.auth.uid && tenantExistsAndOwned(tenantId);
+          allow delete: if isValidId(tenantId) && isValidId(orderId) && isValidId(itemId) && canWriteTenantSection(tenantId, 'orders', 'delete') && existing().ownerId == tenantId;
         }
 
         match /history/{historyId} {
-          allow get: if isValidId(tenantId) && isValidId(orderId) && isValidId(historyId) && isTenantOwner(tenantId) && existing().ownerId == request.auth.uid && tenantExistsAndOwned(tenantId);
-          allow list: if isTenantOwner(tenantId) && resource.data.ownerId == request.auth.uid;
+          allow get: if isValidId(tenantId) && isValidId(orderId) && isValidId(historyId) && canReadTenantSection(tenantId, 'orders') && existing().ownerId == tenantId;
+          allow list: if isVerified() && resource.data.ownerId == tenantId && (request.auth.uid == tenantId || isActiveTenantMember(tenantId) || isSuperAdmin());
           allow create: if isValidId(tenantId) && isValidId(orderId) && isValidId(historyId) &&
-            isTenantOwner(tenantId) &&
+            (canWriteTenantSection(tenantId, 'orders', 'create') || canWriteTenantSection(tenantId, 'orders', 'edit')) &&
             incoming().keys().hasAll(['ownerId', 'status', 'title', 'detail', 'createdAt']) &&
             incoming().keys().hasOnly(['ownerId', 'status', 'title', 'detail', 'createdAt']) &&
             isValidOrderHistory(incoming(), tenantId) &&
             incoming().createdAt == request.time &&
-            tenantExistsAndOwned(tenantId) &&
             exists(/databases/$(database)/documents/tenants/$(tenantId)/orders/$(orderId));
           allow update: if false;
-          allow delete: if isValidId(tenantId) && isValidId(orderId) && isValidId(historyId) && isTenantOwner(tenantId) && existing().ownerId == request.auth.uid && tenantExistsAndOwned(tenantId);
+          allow delete: if isValidId(tenantId) && isValidId(orderId) && isValidId(historyId) && canWriteTenantSection(tenantId, 'orders', 'delete') && existing().ownerId == tenantId;
         }
       }
 
       match /expenses/{expenseId} {
-        allow get: if isValidId(tenantId) && isValidId(expenseId) && isTenantOwner(tenantId) && existing().ownerId == request.auth.uid && tenantExistsAndOwned(tenantId);
-        allow list: if isTenantOwner(tenantId) && resource.data.ownerId == request.auth.uid;
+        allow get: if isValidId(tenantId) && isValidId(expenseId) && canReadTenantSection(tenantId, 'finance') && existing().ownerId == tenantId;
+        allow list: if isVerified() && resource.data.ownerId == tenantId && (request.auth.uid == tenantId || isActiveTenantMember(tenantId) || isSuperAdmin());
         allow create: if isValidId(tenantId) && isValidId(expenseId) &&
-          isTenantOwner(tenantId) &&
+          canWriteTenantSection(tenantId, 'finance', 'create') &&
           incoming().keys().hasAll(['ownerId', 'title', 'category', 'vendor', 'amount', 'expenseDate', 'status', 'notes', 'createdAt', 'updatedAt']) &&
           incoming().keys().hasOnly(['ownerId', 'title', 'category', 'vendor', 'amount', 'currency', 'exchangeRate', 'convertedAmount', 'reportingCurrency', 'rateSource', 'conversionDirection', 'ratePublicationDate', 'rateTimestamp', 'expenseDate', 'status', 'notes', 'createdAt', 'updatedAt']) &&
           isValidExpense(incoming(), tenantId) &&
           incoming().createdAt == request.time &&
-          incoming().updatedAt == request.time &&
-          tenantExistsAndOwned(tenantId);
+          incoming().updatedAt == request.time;
         allow update: if isValidId(tenantId) && isValidId(expenseId) &&
-          isTenantOwner(tenantId) &&
+          canWriteTenantSection(tenantId, 'finance', 'edit') &&
           isValidExpense(incoming(), tenantId) &&
           incoming().ownerId == existing().ownerId &&
           incoming().createdAt == existing().createdAt &&
-          incoming().updatedAt == request.time &&
-          tenantExistsAndOwned(tenantId) && (
-            // Action: Mark expense paid/pending
+          incoming().updatedAt == request.time && (
             incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt']) ||
-            // Action: Edit full expense entry
             incoming().diff(existing()).affectedKeys().hasOnly(['title', 'category', 'vendor', 'amount', 'currency', 'exchangeRate', 'convertedAmount', 'reportingCurrency', 'rateSource', 'conversionDirection', 'ratePublicationDate', 'rateTimestamp', 'expenseDate', 'status', 'notes', 'updatedAt'])
           );
-        allow delete: if isValidId(tenantId) && isValidId(expenseId) && isTenantOwner(tenantId) && existing().ownerId == request.auth.uid && tenantExistsAndOwned(tenantId);
+        allow delete: if isValidId(tenantId) && isValidId(expenseId) && canWriteTenantSection(tenantId, 'finance', 'delete') && existing().ownerId == tenantId;
       }
 
       match /activities/{activityId} {
-        allow get: if isValidId(tenantId) && isValidId(activityId) && isTenantOwner(tenantId) && existing().ownerId == request.auth.uid && tenantExistsAndOwned(tenantId);
-        allow list: if isTenantOwner(tenantId) && resource.data.ownerId == request.auth.uid;
+        allow get: if isValidId(tenantId) && isValidId(activityId) && (isTenantOwner(tenantId) || isActiveTenantMember(tenantId) || isSuperAdmin()) && existing().ownerId == tenantId;
+        allow list: if isVerified() && resource.data.ownerId == tenantId && (request.auth.uid == tenantId || isActiveTenantMember(tenantId) || isSuperAdmin());
         allow create: if isValidId(tenantId) && isValidId(activityId) &&
-          isTenantOwner(tenantId) &&
+          (isTenantOwner(tenantId) || isActiveTenantMember(tenantId)) &&
+          isAccountActive() &&
+          tenantExistsAndOwned(tenantId) &&
           incoming().keys().hasAll(['ownerId', 'type', 'title', 'detail', 'amount', 'createdAt']) &&
           incoming().keys().hasOnly(['ownerId', 'type', 'title', 'detail', 'amount', 'createdAt']) &&
           isValidActivity(incoming(), tenantId) &&
-          incoming().createdAt == request.time &&
-          tenantExistsAndOwned(tenantId);
+          incoming().createdAt == request.time;
         allow update: if false;
-        allow delete: if isValidId(tenantId) && isValidId(activityId) && isTenantOwner(tenantId) && existing().ownerId == request.auth.uid && tenantExistsAndOwned(tenantId);
+        allow delete: if isValidId(tenantId) && isValidId(activityId) && isTenantOwner(tenantId) && isAccountActive() && existing().ownerId == tenantId;
       }
 
       match /researchIdeas/{ideaId} {
-        allow get: if isValidId(tenantId) && isValidId(ideaId) && isTenantOwner(tenantId) && existing().ownerId == request.auth.uid && tenantExistsAndOwned(tenantId);
-        allow list: if isTenantOwner(tenantId) && resource.data.ownerId == request.auth.uid;
+        allow get: if isValidId(tenantId) && isValidId(ideaId) && canReadTenantSection(tenantId, 'products') && existing().ownerId == tenantId;
+        allow list: if isVerified() && resource.data.ownerId == tenantId && (request.auth.uid == tenantId || isActiveTenantMember(tenantId) || isSuperAdmin());
         allow create: if isValidId(tenantId) && isValidId(ideaId) &&
-          isTenantOwner(tenantId) &&
+          canWriteTenantSection(tenantId, 'products', 'create') &&
           incoming().keys().hasAll(['ownerId', 'name', 'targetPrice', 'estimatedCost', 'shippingEstimate', 'adCpaEstimate', 'notes', 'createdAt', 'updatedAt']) &&
           incoming().keys().hasOnly(['ownerId', 'name', 'targetPrice', 'estimatedCost', 'shippingEstimate', 'adCpaEstimate', 'currency', 'notes', 'createdAt', 'updatedAt']) &&
           isValidProductIdea(incoming(), tenantId) &&
           incoming().createdAt == request.time &&
-          incoming().updatedAt == request.time &&
-          tenantExistsAndOwned(tenantId);
+          incoming().updatedAt == request.time;
         allow update: if isValidId(tenantId) && isValidId(ideaId) &&
-          isTenantOwner(tenantId) &&
+          canWriteTenantSection(tenantId, 'products', 'edit') &&
           isValidProductIdea(incoming(), tenantId) &&
           incoming().ownerId == existing().ownerId &&
           incoming().createdAt == existing().createdAt &&
           incoming().updatedAt == request.time &&
-          tenantExistsAndOwned(tenantId) &&
           incoming().diff(existing()).affectedKeys().hasOnly(['name', 'targetPrice', 'estimatedCost', 'shippingEstimate', 'adCpaEstimate', 'currency', 'notes', 'updatedAt']);
-        allow delete: if isValidId(tenantId) && isValidId(ideaId) && isTenantOwner(tenantId) && existing().ownerId == request.auth.uid && tenantExistsAndOwned(tenantId);
+        allow delete: if isValidId(tenantId) && isValidId(ideaId) && canWriteTenantSection(tenantId, 'products', 'delete') && existing().ownerId == tenantId;
       }
     }
   }

@@ -1,4 +1,10 @@
-import type { AuthSessionInfo, InvitationRecord } from '../types/zenorati';
+import type {
+  AuthSessionInfo,
+  CanonicalRole,
+  EmailDeliveryInfo,
+  InvitationRecord,
+  SectionPermissions,
+} from '../types/zenorati';
 
 export interface PasswordValidationResult {
   valid: boolean;
@@ -36,7 +42,7 @@ export class InviteApiError extends Error {
   }
 }
 
-async function parseJsonOrThrow<T>(res: Response): Promise<T> {
+export async function parseJsonOrThrow<T>(res: Response): Promise<T> {
   let body: Record<string, unknown> = {};
   try {
     body = (await res.json()) as Record<string, unknown>;
@@ -65,6 +71,9 @@ export async function checkInvitationPreAuth(code: string): Promise<{
   codePreview?: string;
   remainingUses?: number;
   expiresAt?: string;
+  targetRole?: CanonicalRole;
+  targetFullName?: string;
+  targetBusinessName?: string;
 }> {
   const res = await fetch('/api/auth/invitations/check', {
     method: 'POST',
@@ -82,6 +91,7 @@ export async function verifyInvitationAuthenticated(
   codePreview: string;
   remainingUses: number;
   expiresAt: string;
+  targetRole?: CanonicalRole;
 }> {
   const res = await fetch('/api/auth/invitations/verify-authenticated', {
     method: 'POST',
@@ -131,6 +141,12 @@ export async function createAdminInvitation(params: {
   maxUses: number;
   expiresAtIso: string;
   label?: string;
+  targetEmail?: string;
+  targetFullName?: string;
+  targetBusinessName?: string;
+  targetRole?: CanonicalRole;
+  targetTenantId?: string;
+  targetPermissions?: SectionPermissions;
 }): Promise<{ inviteCode: string; invitation: InvitationRecord }> {
   const res = await fetch('/api/admin/invitations', {
     method: 'POST',
@@ -142,7 +158,24 @@ export async function createAdminInvitation(params: {
       maxUses: params.maxUses,
       expiresAtIso: params.expiresAtIso,
       label: params.label ?? '',
+      targetEmail: params.targetEmail,
+      targetFullName: params.targetFullName,
+      targetBusinessName: params.targetBusinessName,
+      targetRole: params.targetRole,
+      targetTenantId: params.targetTenantId,
+      targetPermissions: params.targetPermissions,
     }),
+  });
+  return parseJsonOrThrow(res);
+}
+
+export async function resendAdminInvitation(
+  idToken: string,
+  inviteId: string
+): Promise<{ invitation: InvitationRecord; emailDelivery: EmailDeliveryInfo }> {
+  const res = await fetch(`/api/admin/invitations/${encodeURIComponent(inviteId)}/resend`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${idToken}` },
   });
   return parseJsonOrThrow(res);
 }

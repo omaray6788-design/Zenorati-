@@ -6,14 +6,85 @@
       "type": "object",
       "properties": {
         "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
-        "role": { "type": "string", "enum": ["owner", "admin"] },
+        "role": { "type": "string", "enum": ["super_admin", "owner", "admin"] },
         "createdAt": { "type": "string", "format": "date-time" }
       },
       "required": ["uid", "role", "createdAt"]
     },
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Independent user account profile with RBAC role, store assignment, and per-section permissions.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "email": { "type": "string", "minLength": 3, "maxLength": 160 },
+        "fullName": { "type": "string", "minLength": 0, "maxLength": 120 },
+        "photoUrl": { "type": "string", "minLength": 0, "maxLength": 500 },
+        "role": { "type": "string", "enum": ["super_admin", "store_owner", "manager", "staff", "viewer"] },
+        "accountStatus": { "type": "string", "enum": ["active", "suspended"] },
+        "tenantId": { "type": "string", "minLength": 0, "maxLength": 128 },
+        "businessName": { "type": "string", "minLength": 0, "maxLength": 100 },
+        "permissions": { "type": "object" },
+        "invitationId": { "type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[a-f0-9]{64}$" },
+        "createdByUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "lastActiveAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email", "fullName", "role", "accountStatus", "permissions", "createdAt", "updatedAt"]
+    },
+    "TenantMember": {
+      "title": "TenantMember",
+      "description": "Authorized non-owner staff/manager/viewer membership inside a specific store tenant.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "tenantId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "email": { "type": "string", "minLength": 3, "maxLength": 160 },
+        "fullName": { "type": "string", "minLength": 0, "maxLength": 120 },
+        "role": { "type": "string", "enum": ["manager", "staff", "viewer"] },
+        "accountStatus": { "type": "string", "enum": ["active", "suspended"] },
+        "permissions": { "type": "object" },
+        "invitedByUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "tenantId", "email", "fullName", "role", "accountStatus", "permissions", "createdAt", "updatedAt"]
+    },
+    "RoleTemplate": {
+      "title": "RoleTemplate",
+      "description": "Platform default permission template for a canonical role.",
+      "type": "object",
+      "properties": {
+        "role": { "type": "string", "enum": ["super_admin", "store_owner", "manager", "staff", "viewer"] },
+        "label": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "description": { "type": "string", "minLength": 0, "maxLength": 240 },
+        "permissions": { "type": "object" },
+        "updatedByUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["role", "label", "description", "permissions", "updatedAt"]
+    },
+    "AdminAuditLog": {
+      "title": "AdminAuditLog",
+      "description": "Immutable append-only audit log of sensitive Super Admin actions and store inspections.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "actorUid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "actorEmail": { "type": "string", "minLength": 3, "maxLength": 160 },
+        "action": { "type": "string", "minLength": 2, "maxLength": 80 },
+        "targetType": { "type": "string", "enum": ["user", "tenant", "invitation", "role_template", "system"] },
+        "targetId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "targetLabel": { "type": "string", "minLength": 0, "maxLength": 160 },
+        "details": { "type": "string", "minLength": 0, "maxLength": 500 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["id", "actorUid", "actorEmail", "action", "targetType", "targetId", "targetLabel", "details", "createdAt"]
+    },
     "Invitation": {
       "title": "Invitation",
-      "description": "Hashed, non-PII invitation record governing invitation-only registration.",
+      "description": "Hashed, invitation-only registration record supporting targeted user roles and store assignment.",
       "type": "object",
       "properties": {
         "id": { "type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[a-f0-9]{64}$" },
@@ -24,6 +95,14 @@
         "status": { "type": "string", "enum": ["active", "used", "revoked"] },
         "maxUses": { "type": "integer" },
         "usedCount": { "type": "integer" },
+        "targetEmail": { "type": "string", "minLength": 0, "maxLength": 160 },
+        "targetFullName": { "type": "string", "minLength": 0, "maxLength": 120 },
+        "targetBusinessName": { "type": "string", "minLength": 0, "maxLength": 100 },
+        "targetRole": { "type": "string", "enum": ["store_owner", "manager", "staff", "viewer"] },
+        "targetTenantId": { "type": "string", "minLength": 0, "maxLength": 128 },
+        "targetPermissions": { "type": "object" },
+        "resendCount": { "type": "integer" },
+        "lastSentAt": { "type": "string", "format": "date-time" },
         "expiresAt": { "type": "string", "format": "date-time" },
         "createdAt": { "type": "string", "format": "date-time" },
         "updatedAt": { "type": "string", "format": "date-time" },
@@ -47,7 +126,7 @@
     },
     "TenantProfile": {
       "title": "TenantProfile",
-      "description": "Isolated business owner workspace profile and store configuration.",
+      "description": "Isolated business store workspace profile and configuration.",
       "type": "object",
       "properties": {
         "ownerId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
@@ -55,7 +134,7 @@
         "ownerEmail": { "type": "string", "minLength": 3, "maxLength": 160 },
         "fullName": { "type": "string", "minLength": 0, "maxLength": 120 },
         "photoUrl": { "type": "string", "minLength": 0, "maxLength": 500 },
-        "role": { "type": "string", "enum": ["owner", "admin", "user"] },
+        "role": { "type": "string", "enum": ["super_admin", "store_owner", "manager", "staff", "viewer", "owner", "admin", "user"] },
         "accountStatus": { "type": "string", "enum": ["active", "suspended"] },
         "invitationId": { "type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[a-f0-9]{64}$" },
         "currency": { "type": "string", "enum": ["USD", "EGP", "EUR", "GBP", "CAD", "AUD"] },
@@ -245,11 +324,23 @@
   "firestore": {
     "/admins/{adminUid}": {
       "schema": { "$ref": "#/entities/AdminMember" },
-      "description": "Read-only admin authorization lookup documents provisioned out-of-band."
+      "description": "Read-only platform owner and super-admin lookup documents provisioned out-of-band."
+    },
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Independent user profiles with RBAC role, account status, assigned store tenantId, and granular section permissions."
+    },
+    "/roleTemplates/{roleId}": {
+      "schema": { "$ref": "#/entities/RoleTemplate" },
+      "description": "Customizable role permission templates managed exclusively by Super Admin."
+    },
+    "/adminAuditLogs/{logId}": {
+      "schema": { "$ref": "#/entities/AdminAuditLog" },
+      "description": "Immutable append-only audit log recording all Super Admin actions and audited store inspections."
     },
     "/invitations/{inviteId}": {
       "schema": { "$ref": "#/entities/Invitation" },
-      "description": "Hashed, non-PII invitation records keyed by SHA-256 hex digest of secret invitation code."
+      "description": "Hashed invitation records keyed by SHA-256 hex digest of secret invitation code."
     },
     "/invitations/{inviteId}/redemptions/{redeemerUid}": {
       "schema": { "$ref": "#/entities/InvitationRedemption" },
@@ -257,19 +348,23 @@
     },
     "/tenants/{tenantId}": {
       "schema": { "$ref": "#/entities/TenantProfile" },
-      "description": "Root tenant document owned exclusively by the business owner matching tenantId == auth.uid."
+      "description": "Root store workspace document owned by store owner or accessed by authorized store members."
+    },
+    "/tenants/{tenantId}/members/{memberUid}": {
+      "schema": { "$ref": "#/entities/TenantMember" },
+      "description": "Authorized team members (manager, staff, viewer) assigned to a specific store tenant."
     },
     "/tenants/{tenantId}/products/{productId}": {
       "schema": { "$ref": "#/entities/Product" },
-      "description": "Private product catalog items isolated per business owner tenant."
+      "description": "Private product catalog items isolated per store tenant."
     },
     "/tenants/{tenantId}/customers/{customerId}": {
       "schema": { "$ref": "#/entities/Customer" },
-      "description": "Private customer records isolated per business owner tenant."
+      "description": "Private customer records isolated per store tenant."
     },
     "/tenants/{tenantId}/orders/{orderId}": {
       "schema": { "$ref": "#/entities/Order" },
-      "description": "Private order records isolated per business owner tenant."
+      "description": "Private order records isolated per store tenant."
     },
     "/tenants/{tenantId}/orders/{orderId}/items/{itemId}": {
       "schema": { "$ref": "#/entities/OrderItem" },
@@ -281,15 +376,15 @@
     },
     "/tenants/{tenantId}/expenses/{expenseId}": {
       "schema": { "$ref": "#/entities/Expense" },
-      "description": "Private business expenses isolated per business owner tenant."
+      "description": "Private business expenses isolated per store tenant."
     },
     "/tenants/{tenantId}/activities/{activityId}": {
       "schema": { "$ref": "#/entities/BusinessActivity" },
-      "description": "Private business activity log isolated per business owner tenant."
+      "description": "Private business activity log isolated per store tenant."
     },
     "/tenants/{tenantId}/researchIdeas/{ideaId}": {
       "schema": { "$ref": "#/entities/ProductIdea" },
-      "description": "Private product research margin ideas isolated per business owner tenant."
+      "description": "Private product research margin ideas isolated per store tenant."
     }
   }
 }

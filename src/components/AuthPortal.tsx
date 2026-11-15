@@ -39,6 +39,7 @@ import {
   verifyInvitationAuthenticated,
 } from '../services/authInviteClient';
 import { fetchExistingCloudTenantProfile } from '../services/tenantStore';
+import { LocalStorageDiagnosticPanel } from './LocalStorageDiagnosticPanel';
 
 export type AuthPortalMode = 'auth' | 'verify_email' | 'needs_activation';
 
@@ -250,7 +251,11 @@ export const AuthPortal: React.FC<AuthPortalProps> = ({
       ]);
 
       const isKnownExistingOrOwner = Boolean(
-        existingTenant || session?.hasTenant || session?.isAdmin
+        existingTenant ||
+          session?.hasTenant ||
+          session?.isSuperAdmin ||
+          session?.isAdmin ||
+          session?.legacyOwnerShellAccess
       );
 
       if (!isKnownExistingOrOwner) {
@@ -547,7 +552,7 @@ export const AuthPortal: React.FC<AuthPortalProps> = ({
       </header>
 
       {/* Main Centered Auth Card */}
-      <main className="flex-1 flex items-center justify-center p-4 sm:p-8">
+      <main className="flex-1 flex flex-col items-center justify-center gap-6 p-4 sm:p-8">
         <div className="w-full max-w-md space-y-5">
           <div className="text-center space-y-1.5">
             <div className="inline-flex items-center gap-1.5 text-xs font-semibold text-blue-600 dark:text-cyan-400">
@@ -1109,6 +1114,9 @@ export const AuthPortal: React.FC<AuthPortalProps> = ({
               </>
             )}
           </div>
+        </div>
+        <div className="w-full max-w-2xl">
+          <LocalStorageDiagnosticPanel />
         </div>
       </main>
     </div>

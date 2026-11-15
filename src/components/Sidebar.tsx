@@ -1,24 +1,30 @@
 import React from 'react';
 import {
-  LayoutDashboard,
-  Package,
-  ShoppingBag,
-  Users,
+  Activity,
   Boxes,
-  Wallet,
-  Megaphone,
-  Lightbulb,
   Bot,
   FileBarChart2,
-  Workflow,
-  Store,
-  User,
-  Ticket,
+  KeyRound,
+  LayoutDashboard,
+  Lightbulb,
+  Megaphone,
+  Package,
+  ScrollText,
   Settings,
+  ShieldCheck,
+  ShoppingBag,
+  Store,
+  Ticket,
+  User,
+  UserCog,
+  Users,
+  Wallet,
+  Workflow,
   X,
 } from 'lucide-react';
-import type { NavSection } from '../types/zenorati';
+import type { CanonicalRole, NavSection, SectionPermissions } from '../types/zenorati';
 import { useI18n } from '../i18n/I18nContext';
+import { hasSectionPermission, navSectionToPermissionSection } from '../utils/permissions';
 
 interface SidebarProps {
   activeSection: NavSection;
@@ -29,7 +35,23 @@ interface SidebarProps {
   isCloudMode: boolean;
   lowStockCount: number;
   isAdmin?: boolean;
+  isSuperAdmin?: boolean;
+  userRole?: CanonicalRole;
+  permissions?: SectionPermissions;
 }
+
+export const SUPER_ADMIN_ITEMS: Array<{
+  id: NavSection;
+  label: string;
+  icon: React.ComponentType<{ className?: string }>;
+}> = [
+  { id: 'sa_overview', label: 'Overview', icon: Activity },
+  { id: 'sa_users', label: 'User Management', icon: UserCog },
+  { id: 'sa_stores', label: 'Store Management', icon: Store },
+  { id: 'sa_invitations', label: 'Invitations', icon: Ticket },
+  { id: 'sa_roles', label: 'Roles & Permissions', icon: KeyRound },
+  { id: 'sa_audit', label: 'Audit Logs', icon: ScrollText },
+];
 
 export const SIDEBAR_ITEMS: Array<{
   id: NavSection;
@@ -64,12 +86,24 @@ export const Sidebar: React.FC<SidebarProps> = ({
   isCloudMode,
   lowStockCount,
   isAdmin = false,
+  isSuperAdmin = false,
+  userRole = 'store_owner',
+  permissions,
 }) => {
   const { t, tNav } = useI18n();
-  const visibleItems = SIDEBAR_ITEMS.filter((item) => !item.adminOnly || isAdmin);
+  const visibleItems = SIDEBAR_ITEMS.filter((item) => {
+    if (item.adminOnly) {
+      return isAdmin && !isSuperAdmin;
+    }
+    const permSection = navSectionToPermissionSection(item.id);
+    if (permSection && permissions) {
+      return hasSectionPermission(permissions, userRole, permSection, 'view');
+    }
+    return true;
+  });
 
   const renderNavContent = () => (
-    <div className="flex flex-col h-full">
+    <div className="flex flex-col h-full min-h-0">
       {/* Brand Header */}
       <div className="h-16 px-5 flex items-center justify-between border-b border-slate-200 dark:border-slate-800/80 shrink-0">
         <button
@@ -107,7 +141,53 @@ export const Sidebar: React.FC<SidebarProps> = ({
       </div>
 
       {/* Navigation List */}
-      <nav className="flex-1 overflow-y-auto px-3 py-4 space-y-1" aria-label="Primary Sidebar Navigation">
+      <nav
+        className="flex-1 min-h-0 overflow-y-auto px-3 py-4 space-y-1"
+        aria-label="Primary Sidebar Navigation"
+      >
+        {isSuperAdmin && (
+          <div
+            data-testid="super-admin-nav-section"
+            className="mb-3 pb-3 border-b border-slate-200/80 dark:border-slate-800/80 space-y-1"
+          >
+            <div className="px-3 py-1 flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider text-indigo-600 dark:text-cyan-400">
+              <ShieldCheck className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+              <span>{t('navSaSection')}</span>
+            </div>
+            {SUPER_ADMIN_ITEMS.map((item) => {
+              const Icon = item.icon;
+              const isActive = activeSection === item.id;
+              return (
+                <button
+                  key={item.id}
+                  type="button"
+                  data-nav-section={item.id}
+                  onClick={() => {
+                    onSelectSection(item.id);
+                    onCloseMobile();
+                  }}
+                  className={`w-full flex items-center justify-between gap-3 px-3 py-2.5 rounded-xl text-xs font-medium transition-colors cursor-pointer whitespace-nowrap ${
+                    isActive
+                      ? 'bg-gradient-to-r from-indigo-600/15 via-blue-600/10 to-cyan-500/10 text-indigo-600 dark:text-cyan-300 border border-indigo-500/30'
+                      : 'text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-slate-800/50 border border-transparent'
+                  }`}
+                >
+                  <span className="flex items-center gap-3 min-w-0">
+                    <Icon
+                      className={`w-4 h-4 shrink-0 ${
+                        isActive
+                          ? 'text-indigo-600 dark:text-cyan-400'
+                          : 'text-slate-400 dark:text-slate-500'
+                      }`}
+                    />
+                    <span className="truncate">{tNav(item.id)}</span>
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        )}
+
         {visibleItems.map((item, idx) => {
           const Icon = item.icon;
           const isActive = activeSection === item.id;
@@ -121,6 +201,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
               )}
               <button
                 type="button"
+                data-nav-section={item.id}
                 onClick={() => {
                   onSelectSection(item.id);
                   onCloseMobile();
@@ -177,7 +258,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
             onClick={onCloseMobile}
             aria-hidden="true"
           />
-          <aside className="relative z-10 w-72 max-w-[85vw] h-full bg-white dark:bg-[#070D1D] border-e border-slate-200 dark:border-slate-800 shadow-2xl">
+          <aside className="relative z-10 flex flex-col w-72 max-w-[85vw] h-full bg-white dark:bg-[#070D1D] border-e border-slate-200 dark:border-slate-800 shadow-2xl">
             {renderNavContent()}
           </aside>
         </div>

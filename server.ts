@@ -6,6 +6,8 @@ import { fileURLToPath } from 'node:url';
 import { GoogleGenAI } from '@google/genai';
 import { cbeRateMonitor, verifyCronSecret } from './server/cbeRateService';
 import { authInviteService, AuthServiceError } from './server/authInviteService';
+import { superAdminService } from './server/superAdminService';
+import type { CanonicalRole } from './src/types/zenorati';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -220,6 +222,214 @@ async function startServer() {
     }
   });
 
+  app.get('/api/admin/overview', async (req: Request, res: Response) => {
+    const token = extractBearerToken(req);
+    if (!token) {
+      res.status(401).json({ error: 'Authentication token is required.', code: 'AUTH_REQUIRED' });
+      return;
+    }
+    try {
+      const overview = await superAdminService.getOverview(token);
+      res.json(overview);
+    } catch (error) {
+      sendAuthError(res, error);
+    }
+  });
+
+  app.get('/api/admin/users', async (req: Request, res: Response) => {
+    const token = extractBearerToken(req);
+    if (!token) {
+      res.status(401).json({ error: 'Authentication token is required.', code: 'AUTH_REQUIRED' });
+      return;
+    }
+    try {
+      const users = await superAdminService.listUsers(token);
+      res.json({ users });
+    } catch (error) {
+      sendAuthError(res, error);
+    }
+  });
+
+  app.post('/api/admin/users/invite', async (req: Request, res: Response) => {
+    const token = extractBearerToken(req);
+    if (!token) {
+      res.status(401).json({ error: 'Authentication token is required.', code: 'AUTH_REQUIRED' });
+      return;
+    }
+    try {
+      const proto = (req.headers['x-forwarded-proto'] as string) || req.protocol || 'https';
+      const host = req.get('host');
+      const appOrigin = host ? `${proto}://${host}` : undefined;
+      const result = await superAdminService.inviteUser(token, {
+        email: typeof req.body?.email === 'string' ? req.body.email : '',
+        fullName: typeof req.body?.fullName === 'string' ? req.body.fullName : undefined,
+        businessName: typeof req.body?.businessName === 'string' ? req.body.businessName : undefined,
+        role: (typeof req.body?.role === 'string' ? req.body.role : 'store_owner') as CanonicalRole,
+        tenantId: typeof req.body?.tenantId === 'string' ? req.body.tenantId : undefined,
+        permissions: req.body?.permissions,
+        maxUses: req.body?.maxUses !== undefined ? Number(req.body.maxUses) : 1,
+        expiresAtIso: typeof req.body?.expiresAtIso === 'string' ? req.body.expiresAtIso : undefined,
+        label: typeof req.body?.label === 'string' ? req.body.label : undefined,
+        appOrigin,
+      });
+      res.status(201).json(result);
+    } catch (error) {
+      sendAuthError(res, error);
+    }
+  });
+
+  app.patch('/api/admin/users/:uid', async (req: Request, res: Response) => {
+    const token = extractBearerToken(req);
+    if (!token) {
+      res.status(401).json({ error: 'Authentication token is required.', code: 'AUTH_REQUIRED' });
+      return;
+    }
+    try {
+      const uid = String(req.params.uid ?? '');
+      const user = await superAdminService.updateUser(token, uid, {
+        fullName: typeof req.body?.fullName === 'string' ? req.body.fullName : undefined,
+        role: typeof req.body?.role === 'string' ? (req.body.role as CanonicalRole) : undefined,
+        tenantId: req.body?.tenantId === null || typeof req.body?.tenantId === 'string' ? req.body.tenantId : undefined,
+        businessName: typeof req.body?.businessName === 'string' ? req.body.businessName : undefined,
+        permissions: req.body?.permissions,
+      });
+      res.json({ user });
+    } catch (error) {
+      sendAuthError(res, error);
+    }
+  });
+
+  app.post('/api/admin/users/:uid/status', async (req: Request, res: Response) => {
+    const token = extractBearerToken(req);
+    if (!token) {
+      res.status(401).json({ error: 'Authentication token is required.', code: 'AUTH_REQUIRED' });
+      return;
+    }
+    try {
+      const uid = String(req.params.uid ?? '');
+      const status = req.body?.accountStatus === 'suspended' ? 'suspended' : 'active';
+      const user = await superAdminService.updateUserStatus(token, uid, status);
+      res.json({ user });
+    } catch (error) {
+      sendAuthError(res, error);
+    }
+  });
+
+  app.delete('/api/admin/users/:uid', async (req: Request, res: Response) => {
+    const token = extractBearerToken(req);
+    if (!token) {
+      res.status(401).json({ error: 'Authentication token is required.', code: 'AUTH_REQUIRED' });
+      return;
+    }
+    try {
+      const uid = String(req.params.uid ?? '');
+      const confirmUid = typeof req.body?.confirmUid === 'string' ? req.body.confirmUid : '';
+      const confirmationText =
+        typeof req.body?.confirmationText === 'string' ? req.body.confirmationText : '';
+      const result = await superAdminService.deleteUserAccount(
+        token,
+        uid,
+        confirmUid,
+        confirmationText
+      );
+      res.json(result);
+    } catch (error) {
+      sendAuthError(res, error);
+    }
+  });
+
+  app.get('/api/admin/stores', async (req: Request, res: Response) => {
+    const token = extractBearerToken(req);
+    if (!token) {
+      res.status(401).json({ error: 'Authentication token is required.', code: 'AUTH_REQUIRED' });
+      return;
+    }
+    try {
+      const stores = await superAdminService.listStores(token);
+      res.json({ stores });
+    } catch (error) {
+      sendAuthError(res, error);
+    }
+  });
+
+  app.post('/api/admin/stores/:tenantId/status', async (req: Request, res: Response) => {
+    const token = extractBearerToken(req);
+    if (!token) {
+      res.status(401).json({ error: 'Authentication token is required.', code: 'AUTH_REQUIRED' });
+      return;
+    }
+    try {
+      const tenantId = String(req.params.tenantId ?? '');
+      const status = req.body?.accountStatus === 'suspended' ? 'suspended' : 'active';
+      const store = await superAdminService.updateStoreStatus(token, tenantId, status);
+      res.json({ store });
+    } catch (error) {
+      sendAuthError(res, error);
+    }
+  });
+
+  app.post('/api/admin/stores/:tenantId/inspect', async (req: Request, res: Response) => {
+    const token = extractBearerToken(req);
+    if (!token) {
+      res.status(401).json({ error: 'Authentication token is required.', code: 'AUTH_REQUIRED' });
+      return;
+    }
+    try {
+      const tenantId = String(req.params.tenantId ?? '');
+      const report = await superAdminService.inspectStore(token, tenantId);
+      res.json({ report });
+    } catch (error) {
+      sendAuthError(res, error);
+    }
+  });
+
+  app.get('/api/admin/roles', async (req: Request, res: Response) => {
+    const token = extractBearerToken(req);
+    if (!token) {
+      res.status(401).json({ error: 'Authentication token is required.', code: 'AUTH_REQUIRED' });
+      return;
+    }
+    try {
+      const roles = await superAdminService.listRoleTemplates(token);
+      res.json({ roles });
+    } catch (error) {
+      sendAuthError(res, error);
+    }
+  });
+
+  app.put('/api/admin/roles/:roleId', async (req: Request, res: Response) => {
+    const token = extractBearerToken(req);
+    if (!token) {
+      res.status(401).json({ error: 'Authentication token is required.', code: 'AUTH_REQUIRED' });
+      return;
+    }
+    try {
+      const roleId = String(req.params.roleId ?? '') as CanonicalRole;
+      const role = await superAdminService.updateRoleTemplate(token, roleId, {
+        label: typeof req.body?.label === 'string' ? req.body.label : undefined,
+        description: typeof req.body?.description === 'string' ? req.body.description : undefined,
+        permissions: req.body?.permissions,
+      });
+      res.json({ role });
+    } catch (error) {
+      sendAuthError(res, error);
+    }
+  });
+
+  app.get('/api/admin/audit-logs', async (req: Request, res: Response) => {
+    const token = extractBearerToken(req);
+    if (!token) {
+      res.status(401).json({ error: 'Authentication token is required.', code: 'AUTH_REQUIRED' });
+      return;
+    }
+    try {
+      const logs = await superAdminService.listAuditLogs(token);
+      res.json({ logs });
+    } catch (error) {
+      sendAuthError(res, error);
+    }
+  });
+
   app.get('/api/admin/invitations', async (req: Request, res: Response) => {
     const token = extractBearerToken(req);
     if (!token) {
@@ -250,8 +460,33 @@ async function startServer() {
         maxUses,
         expiresAtIso,
         label,
+        targetEmail: typeof req.body?.targetEmail === 'string' ? req.body.targetEmail : undefined,
+        targetFullName: typeof req.body?.targetFullName === 'string' ? req.body.targetFullName : undefined,
+        targetBusinessName:
+          typeof req.body?.targetBusinessName === 'string' ? req.body.targetBusinessName : undefined,
+        targetRole: typeof req.body?.targetRole === 'string' ? (req.body.targetRole as CanonicalRole) : undefined,
+        targetTenantId: typeof req.body?.targetTenantId === 'string' ? req.body.targetTenantId : undefined,
+        targetPermissions: req.body?.targetPermissions,
       });
       res.status(201).json(created);
+    } catch (error) {
+      sendAuthError(res, error);
+    }
+  });
+
+  app.post('/api/admin/invitations/:inviteId/resend', async (req: Request, res: Response) => {
+    const token = extractBearerToken(req);
+    if (!token) {
+      res.status(401).json({ error: 'Authentication token is required.', code: 'AUTH_REQUIRED' });
+      return;
+    }
+    try {
+      const inviteId = String(req.params.inviteId ?? '');
+      const proto = (req.headers['x-forwarded-proto'] as string) || req.protocol || 'https';
+      const host = req.get('host');
+      const appOrigin = host ? `${proto}://${host}` : undefined;
+      const result = await superAdminService.resendInvitation(token, inviteId, appOrigin);
+      res.json(result);
     } catch (error) {
       sendAuthError(res, error);
     }

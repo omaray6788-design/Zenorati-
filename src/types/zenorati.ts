@@ -13,7 +13,13 @@ export type NavSection =
   | 'integrations'
   | 'profile'
   | 'invitations'
-  | 'settings';
+  | 'settings'
+  | 'sa_overview'
+  | 'sa_users'
+  | 'sa_stores'
+  | 'sa_invitations'
+  | 'sa_roles'
+  | 'sa_audit';
 
 export type CurrencyCode = 'USD' | 'EGP' | 'EUR' | 'GBP' | 'CAD' | 'AUD';
 
@@ -95,7 +101,38 @@ export type ActivityType =
   | 'customer'
   | 'settings';
 
-export type UserRole = 'owner' | 'admin' | 'user';
+export type UserRole =
+  | 'super_admin'
+  | 'store_owner'
+  | 'manager'
+  | 'staff'
+  | 'viewer'
+  | 'owner'
+  | 'admin'
+  | 'user';
+
+export type CanonicalRole = 'super_admin' | 'store_owner' | 'manager' | 'staff' | 'viewer';
+
+export type PermissionSection =
+  | 'products'
+  | 'orders'
+  | 'customers'
+  | 'inventory'
+  | 'finance'
+  | 'marketing'
+  | 'reports'
+  | 'settings';
+
+export type PermissionAction = 'view' | 'create' | 'edit' | 'delete';
+
+export interface SectionPermission {
+  view: boolean;
+  create: boolean;
+  edit: boolean;
+  delete: boolean;
+}
+
+export type SectionPermissions = Record<PermissionSection, SectionPermission>;
 
 export type AccountStatus = 'active' | 'suspended';
 
@@ -123,7 +160,34 @@ export interface InvitationRecord {
   createdAt: string;
   updatedAt: string;
   revokedAt?: string;
+  targetEmail?: string;
+  targetFullName?: string;
+  targetBusinessName?: string;
+  targetRole?: CanonicalRole;
+  targetTenantId?: string;
+  targetPermissions?: SectionPermissions;
+  lastSentAt?: string;
+  resendCount?: number;
   redemptions?: InvitationRedemption[];
+}
+
+export interface SuperAdminDiagnostic {
+  hasAdminDoc: boolean;
+  adminDocRole: string | null;
+  envOwnerUidMatched: boolean;
+  reason:
+    | 'verified_admin_doc'
+    | 'verified_owner_uid'
+    | 'email_unverified'
+    | 'missing_admin_doc'
+    | 'role_insufficient';
+}
+
+export interface EmailDeliveryInfo {
+  sent: boolean;
+  provider: 'resend' | 'manual_link';
+  message: string;
+  mailtoUrl?: string;
 }
 
 export interface AuthSessionInfo {
@@ -135,8 +199,89 @@ export interface AuthSessionInfo {
   createdAt: string | null;
   providerIds: string[];
   isAdmin: boolean;
-  role: UserRole;
+  isSuperAdmin: boolean;
+  role: CanonicalRole;
+  accountStatus: AccountStatus;
+  tenantId: string | null;
+  permissions: SectionPermissions;
   hasTenant: boolean;
+  legacyOwnerShellAccess?: boolean;
+  superAdminDiagnostic: SuperAdminDiagnostic;
+}
+
+export interface PlatformUserRecord {
+  uid: string;
+  email: string;
+  fullName: string;
+  photoUrl?: string;
+  role: CanonicalRole;
+  accountStatus: AccountStatus;
+  tenantId: string | null;
+  businessName?: string;
+  permissions: SectionPermissions;
+  invitationId?: string;
+  createdByUid?: string;
+  createdAt?: string;
+  lastActiveAt?: string;
+  updatedAt?: string;
+  source?: 'users_collection' | 'legacy_tenant';
+}
+
+export interface StoreSummaryRecord {
+  tenantId: string;
+  ownerId: string;
+  ownerEmail: string;
+  businessName: string;
+  currency: CurrencyCode;
+  accountStatus: AccountStatus;
+  memberCount: number;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface StoreInspectionReport {
+  tenantId: string;
+  profile: TenantProfile;
+  counts: {
+    products: number;
+    orders: number;
+    customers: number;
+    expenses: number;
+    members: number;
+  };
+  auditLogId: string;
+  inspectedAt: string;
+}
+
+export interface RoleTemplateRecord {
+  role: CanonicalRole;
+  label: string;
+  description: string;
+  permissions: SectionPermissions;
+  updatedAt?: string;
+  updatedByUid?: string;
+}
+
+export interface AdminAuditLogEntry {
+  id: string;
+  actorUid: string;
+  actorEmail: string;
+  action: string;
+  targetType: 'user' | 'tenant' | 'invitation' | 'role_template' | 'system';
+  targetId: string;
+  targetLabel: string;
+  details: string;
+  createdAt: string;
+}
+
+export interface SuperAdminOverviewData {
+  totalUsers: number;
+  totalStores: number;
+  activeAccounts: number;
+  suspendedAccounts: number;
+  pendingInvitations: number;
+  recentAuditLogs: AdminAuditLogEntry[];
+  recentUsers: PlatformUserRecord[];
 }
 
 export interface TenantProfile {

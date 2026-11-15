@@ -22,11 +22,13 @@ import { useI18n } from '../i18n/I18nContext';
 import type {
   AppLanguage,
   AuthSessionInfo,
+  CanonicalRole,
   CurrencyCode,
   InvitationRecord,
   InvitationStatus,
   TenantProfile,
 } from '../types/zenorati';
+import { normalizeCanonicalRole } from '../utils/permissions';
 import {
   createAdminInvitation,
   listAdminInvitations,
@@ -89,20 +91,26 @@ export const UserProfileView: React.FC<UserProfileViewProps> = ({
     setImgBroken(false);
   }, [profile, firebaseUser.displayName, firebaseUser.photoURL, language]);
 
-  const effectiveRole = useMemo(() => {
-    if (sessionInfo?.role === 'owner' || profile.role === 'owner') return 'owner';
-    if (sessionInfo?.isAdmin || sessionInfo?.role === 'admin' || profile.role === 'admin') {
-      return 'admin';
-    }
-    return 'user';
-  }, [sessionInfo?.role, sessionInfo?.isAdmin, profile.role]);
+  const effectiveRole: CanonicalRole = useMemo(() => {
+    if (sessionInfo?.isSuperAdmin) return 'super_admin';
+    if (sessionInfo?.role) return normalizeCanonicalRole(sessionInfo.role, 'tenant');
+    return normalizeCanonicalRole(profile.role, 'tenant');
+  }, [sessionInfo?.isSuperAdmin, sessionInfo?.role, profile.role]);
 
   const roleLabel =
-    effectiveRole === 'owner'
-      ? t('profileRoleOwner')
-      : effectiveRole === 'admin'
-      ? t('profileRoleAdmin')
-      : t('profileRoleUser');
+    effectiveRole === 'super_admin'
+      ? t('saRoleSuperAdmin')
+      : effectiveRole === 'store_owner'
+      ? t('saRoleStoreOwner')
+      : effectiveRole === 'manager'
+      ? t('saRoleManager')
+      : effectiveRole === 'staff'
+      ? t('saRoleStaff')
+      : t('saRoleViewer');
+
+  const accountStatus = sessionInfo?.accountStatus ?? profile.accountStatus ?? 'active';
+  const superAdminDiag = sessionInfo?.superAdminDiagnostic ?? null;
+  const isVerifiedSuperAdmin = Boolean(sessionInfo?.isSuperAdmin);
 
   const accountCreatedAt =
     profile.createdAt ?? firebaseUser.metadata.creationTime ?? null;
@@ -218,7 +226,7 @@ export const UserProfileView: React.FC<UserProfileViewProps> = ({
                   {roleLabel}
                 </span>
                 <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-lg text-[11px] font-semibold border border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400">
-                  {profile.accountStatus === 'suspended'
+                  {accountStatus === 'suspended'
                     ? t('profileStatusSuspended')
                     : t('profileStatusActive')}
                 </span>
@@ -294,7 +302,7 @@ export const UserProfileView: React.FC<UserProfileViewProps> = ({
             </div>
             <div className="mt-1 text-xs font-semibold text-slate-800 dark:text-slate-200">
               {roleLabel} ·{' '}
-              {profile.accountStatus === 'suspended'
+              {accountStatus === 'suspended'
                 ? t('profileStatusSuspended')
                 : t('profileStatusActive')}
             </div>
@@ -304,6 +312,52 @@ export const UserProfileView: React.FC<UserProfileViewProps> = ({
         <div className="text-[11px] text-slate-500 dark:text-slate-400 flex items-center gap-1.5">
           <ShieldCheck className="w-3.5 h-3.5 text-blue-500 shrink-0" aria-hidden="true" />
           <span>{t('profileSecurityNote')}</span>
+        </div>
+      </div>
+
+      {/* Super Admin Verification Diagnostic Card (Read-Only) */}
+      <div className="rounded-2xl border border-slate-200 dark:border-slate-800/80 bg-white dark:bg-[#0B1328] p-5 space-y-2.5">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex items-center gap-2 text-sm font-semibold text-slate-900 dark:text-white">
+            <ShieldCheck
+              className={`w-4 h-4 ${
+                isVerifiedSuperAdmin
+                  ? 'text-emerald-600 dark:text-emerald-400'
+                  : 'text-amber-600 dark:text-amber-400'
+              }`}
+              aria-hidden="true"
+            />
+            <span>{t('saDiagTitle')}</span>
+          </div>
+          <span
+            className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-lg text-[11px] font-semibold border ${
+              isVerifiedSuperAdmin
+                ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400'
+                : 'border-amber-500/30 bg-amber-500/10 text-amber-700 dark:text-amber-400'
+            }`}
+          >
+            {isVerifiedSuperAdmin
+              ? t('saDiagVerified', { uid: firebaseUser.uid })
+              : t('saDiagUnverified')}
+          </span>
+        </div>
+
+        <div className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
+          {isVerifiedSuperAdmin ? (
+            <span>
+              {t('saDiagVerified', { uid: firebaseUser.uid })} ·{' '}
+              <span className="font-mono">{superAdminDiag?.adminDocRole ?? 'super_admin'}</span>
+            </span>
+          ) : superAdminDiag?.reason === 'email_unverified' ? (
+            t('saDiagEmailUnverified')
+          ) : superAdminDiag?.reason === 'role_insufficient' ? (
+            t('saDiagRoleInsufficient', {
+              uid: firebaseUser.uid,
+              role: superAdminDiag.adminDocRole ?? 'unknown',
+            })
+          ) : (
+            t('saDiagMissingAdminDoc', { uid: firebaseUser.uid })
+          )}
         </div>
       </div>
 

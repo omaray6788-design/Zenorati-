@@ -2,14 +2,29 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import type {
+  AccountStatus,
+  AdminAuditLogEntry,
   AuthSessionInfo,
+  CanonicalRole,
+  CurrencyCode,
   InvitationRecord,
   InvitationRedemption,
   InvitationStatus,
+  PlatformUserRecord,
+  RoleTemplateRecord,
+  SectionPermissions,
+  SuperAdminDiagnostic,
+  TenantProfile,
   UserRole,
 } from '../src/types/zenorati';
+import {
+  getDefaultPermissionsForRole,
+  normalizeCanonicalRole,
+  PERMISSION_SECTIONS,
+  sanitizePermissions,
+} from '../src/utils/permissions';
 
-interface FirebaseAppletConfig {
+export interface FirebaseAppletConfig {
   projectId: string;
   apiKey: string;
   firestoreDatabaseId: string;
@@ -19,7 +34,7 @@ const CONFIG_PATH = path.resolve(process.cwd(), 'firebase-applet-config.json');
 const INVITE_CACHE_PATH = path.resolve(process.cwd(), '.zenorati-invites.json');
 const CODE_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ'; // 32 unambiguous chars (5 bits each)
 
-function loadFirebaseConfig(): FirebaseAppletConfig {
+export function loadFirebaseConfig(): FirebaseAppletConfig {
   const raw = fs.readFileSync(CONFIG_PATH, 'utf8');
   const parsed = JSON.parse(raw) as Partial<FirebaseAppletConfig>;
   if (!parsed.projectId || !parsed.apiKey || !parsed.firestoreDatabaseId) {
@@ -135,9 +150,28 @@ export interface VerifiedFirebaseUser {
   providerIds: string[];
 }
 
+export interface TenantMemberRecord {
+  uid: string;
+  tenantId: string;
+  email: string;
+  fullName: string;
+  role: 'manager' | 'staff' | 'viewer';
+  accountStatus: AccountStatus;
+  permissions: SectionPermissions;
+  invitedByUid?: string;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
 export interface InviteStoreBackend {
   verifyIdToken(idToken: string): Promise<VerifiedFirebaseUser>;
   getAdminDoc(uid: string, idToken: string): Promise<{ uid: string; role: UserRole } | null>;
+  getUserDoc(uid: string, idToken: string): Promise<PlatformUserRecord | null>;
+  getTenantMember(
+    tenantId: string,
+    memberUid: string,
+    idToken: string
+  ): Promise<TenantMemberRecord | null>;
   tenantExists(uid: string, idToken: string): Promise<boolean>;
   getInvitation(inviteId: string, idToken: string): Promise<{ doc: InvitationRecord; updateTime?: string } | null>;
   listInvitations(idToken: string): Promise<InvitationRecord[]>;
@@ -154,22 +188,24 @@ export interface InviteStoreBackend {
   }): Promise<{ invitation: InvitationRecord; redemption: InvitationRedemption }>;
 }
 
-type FirestoreJsonValue =
+export type FirestoreJsonValue =
   | { stringValue: string }
   | { integerValue: string }
   | { doubleValue: number }
   | { booleanValue: boolean }
   | { timestampValue: string }
-  | { nullValue: null };
+  | { nullValue: null }
+  | { mapValue: { fields?: Record<string, FirestoreJsonValue> } }
+  | { arrayValue: { values?: FirestoreJsonValue[] } };
 
-interface FirestoreRestDoc {
+export interface FirestoreRestDoc {
   name?: string;
   fields?: Record<string, FirestoreJsonValue>;
   createTime?: string;
   updateTime?: string;
 }
 
-function fromFsVal(val: FirestoreJsonValue | undefined): unknown {
+export function fromFsVal(val: FirestoreJsonValue | undefined): unknown {
   if (!val) return undefined;
   if ('stringValue' in val) return val.stringValue;
   if ('integerValue' in val) return Number.parseInt(val.integerValue, 10);
@@ -177,13 +213,53 @@ function fromFsVal(val: FirestoreJsonValue | undefined): unknown {
   if ('booleanValue' in val) return Boolean(val.booleanValue);
   if ('timestampValue' in val) return val.timestampValue;
   if ('nullValue' in val) return null;
+  if ('mapValue' in val) {
+    const out: Record<string, unknown> = {};
+    const fields = val.mapValue.fields ?? {};
+    for (const [k, v] of Object.entries(fields)) {
+      out[k] = fromFsVal(v);
+    }
+    return out;
+  }
+  if ('arrayValue' in val) {
+    return (val.arrayValue.values ?? []).map((v) => fromFsVal(v));
+  }
   return undefined;
+}
+
+export function permissionsToFsMap(perms: SectionPermissions): FirestoreJsonValue {
+  const fields: Record<string, FirestoreJsonValue> = {};
+  for (const section of PERMISSION_SECTIONS) {
+    const entry = perms[section];
+    fields[section] = {
+      mapValue: {
+        fields: {
+          view: { booleanValue: Boolean(entry?.view) },
+          create: { booleanValue: Boolean(entry?.create) },
+          edit: { booleanValue: Boolean(entry?.edit) },
+          delete: { booleanValue: Boolean(entry?.delete) },
+        },
+      },
+    };
+  }
+  return { mapValue: { fields } };
 }
 
 function docToInvitation(doc: FirestoreRestDoc): InvitationRecord {
   const f = doc.fields ?? {};
   const idFromName = doc.name?.split('/').pop() ?? '';
   const id = String(fromFsVal(f.id) ?? idFromName);
+  const targetRoleRaw = fromFsVal(f.targetRole);
+  const targetRole: CanonicalRole | undefined =
+    typeof targetRoleRaw === 'string' &&
+    ['store_owner', 'manager', 'staff', 'viewer'].includes(targetRoleRaw)
+      ? (targetRoleRaw as CanonicalRole)
+      : undefined;
+  const targetPermissionsRaw = fromFsVal(f.targetPermissions);
+  const targetPermissions = targetPermissionsRaw
+    ? sanitizePermissions(targetPermissionsRaw, targetRole ?? 'store_owner')
+    : undefined;
+
   return {
     id,
     codeHash: String(fromFsVal(f.codeHash) ?? id),
@@ -197,6 +273,18 @@ function docToInvitation(doc: FirestoreRestDoc): InvitationRecord {
     createdAt: String(fromFsVal(f.createdAt) ?? doc.createTime ?? ''),
     updatedAt: String(fromFsVal(f.updatedAt) ?? doc.updateTime ?? ''),
     ...(fromFsVal(f.revokedAt) ? { revokedAt: String(fromFsVal(f.revokedAt)) } : {}),
+    ...(fromFsVal(f.targetEmail) ? { targetEmail: String(fromFsVal(f.targetEmail)) } : {}),
+    ...(fromFsVal(f.targetFullName) ? { targetFullName: String(fromFsVal(f.targetFullName)) } : {}),
+    ...(fromFsVal(f.targetBusinessName)
+      ? { targetBusinessName: String(fromFsVal(f.targetBusinessName)) }
+      : {}),
+    ...(targetRole ? { targetRole } : {}),
+    ...(fromFsVal(f.targetTenantId) ? { targetTenantId: String(fromFsVal(f.targetTenantId)) } : {}),
+    ...(targetPermissions ? { targetPermissions } : {}),
+    ...(fromFsVal(f.lastSentAt) ? { lastSentAt: String(fromFsVal(f.lastSentAt)) } : {}),
+    ...(fromFsVal(f.resendCount) !== undefined
+      ? { resendCount: Number(fromFsVal(f.resendCount)) }
+      : {}),
   };
 }
 
@@ -213,10 +301,92 @@ function docToRedemption(doc: FirestoreRestDoc): InvitationRedemption {
   };
 }
 
+export function docToUserProfile(doc: FirestoreRestDoc): PlatformUserRecord {
+  const f = doc.fields ?? {};
+  const uidFromName = doc.name?.split('/').pop() ?? '';
+  const uid = String(fromFsVal(f.uid) ?? uidFromName);
+  const role = normalizeCanonicalRole(String(fromFsVal(f.role) ?? 'store_owner'), 'tenant');
+  const statusRaw = String(fromFsVal(f.accountStatus) ?? 'active');
+  const accountStatus: AccountStatus = statusRaw === 'suspended' ? 'suspended' : 'active';
+  const tenantIdVal = fromFsVal(f.tenantId);
+  const permissions = sanitizePermissions(fromFsVal(f.permissions), role);
+
+  return {
+    uid,
+    email: String(fromFsVal(f.email) ?? ''),
+    fullName: String(fromFsVal(f.fullName) ?? ''),
+    ...(fromFsVal(f.photoUrl) ? { photoUrl: String(fromFsVal(f.photoUrl)) } : {}),
+    role,
+    accountStatus,
+    tenantId: typeof tenantIdVal === 'string' && tenantIdVal.trim() ? tenantIdVal : null,
+    ...(fromFsVal(f.businessName) ? { businessName: String(fromFsVal(f.businessName)) } : {}),
+    permissions,
+    ...(fromFsVal(f.invitationId) ? { invitationId: String(fromFsVal(f.invitationId)) } : {}),
+    ...(fromFsVal(f.createdByUid) ? { createdByUid: String(fromFsVal(f.createdByUid)) } : {}),
+    ...(fromFsVal(f.createdAt)
+      ? { createdAt: String(fromFsVal(f.createdAt)) }
+      : doc.createTime
+      ? { createdAt: doc.createTime }
+      : {}),
+    ...(fromFsVal(f.lastActiveAt) ? { lastActiveAt: String(fromFsVal(f.lastActiveAt)) } : {}),
+    ...(fromFsVal(f.updatedAt)
+      ? { updatedAt: String(fromFsVal(f.updatedAt)) }
+      : doc.updateTime
+      ? { updatedAt: doc.updateTime }
+      : {}),
+    source: 'users_collection',
+  };
+}
+
+export function docToTenantProfile(doc: FirestoreRestDoc): TenantProfile & { tenantId: string } {
+  const f = doc.fields ?? {};
+  const idFromName = doc.name?.split('/').pop() ?? '';
+  const ownerId = String(fromFsVal(f.ownerId) ?? idFromName);
+  const statusRaw = String(fromFsVal(f.accountStatus) ?? 'active');
+  return {
+    tenantId: idFromName || ownerId,
+    ownerId,
+    businessName: String(fromFsVal(f.businessName) ?? 'ZENORATI Store'),
+    ownerEmail: String(fromFsVal(f.ownerEmail) ?? ''),
+    ...(fromFsVal(f.fullName) ? { fullName: String(fromFsVal(f.fullName)) } : {}),
+    ...(fromFsVal(f.photoUrl) ? { photoUrl: String(fromFsVal(f.photoUrl)) } : {}),
+    ...(fromFsVal(f.role) ? { role: String(fromFsVal(f.role)) as UserRole } : {}),
+    accountStatus: statusRaw === 'suspended' ? 'suspended' : 'active',
+    ...(fromFsVal(f.invitationId) ? { invitationId: String(fromFsVal(f.invitationId)) } : {}),
+    currency: (String(fromFsVal(f.currency) ?? 'USD') as CurrencyCode) || 'USD',
+    ...(fromFsVal(f.usdToEgpRate) ? { usdToEgpRate: Number(fromFsVal(f.usdToEgpRate)) } : {}),
+    taxRate: Number(fromFsVal(f.taxRate) ?? 0),
+    lowStockThreshold: Number(fromFsVal(f.lowStockThreshold) ?? 12),
+    createdAt: String(fromFsVal(f.createdAt) ?? doc.createTime ?? ''),
+    updatedAt: String(fromFsVal(f.updatedAt) ?? doc.updateTime ?? ''),
+  };
+}
+
+function docToTenantMember(doc: FirestoreRestDoc): TenantMemberRecord {
+  const f = doc.fields ?? {};
+  const uidFromName = doc.name?.split('/').pop() ?? '';
+  const roleRaw = String(fromFsVal(f.role) ?? 'staff');
+  const role: 'manager' | 'staff' | 'viewer' =
+    roleRaw === 'manager' || roleRaw === 'viewer' ? roleRaw : 'staff';
+  const statusRaw = String(fromFsVal(f.accountStatus) ?? 'active');
+  return {
+    uid: String(fromFsVal(f.uid) ?? uidFromName),
+    tenantId: String(fromFsVal(f.tenantId) ?? ''),
+    email: String(fromFsVal(f.email) ?? ''),
+    fullName: String(fromFsVal(f.fullName) ?? ''),
+    role,
+    accountStatus: statusRaw === 'suspended' ? 'suspended' : 'active',
+    permissions: sanitizePermissions(fromFsVal(f.permissions), role),
+    ...(fromFsVal(f.invitedByUid) ? { invitedByUid: String(fromFsVal(f.invitedByUid)) } : {}),
+    ...(fromFsVal(f.createdAt) ? { createdAt: String(fromFsVal(f.createdAt)) } : {}),
+    ...(fromFsVal(f.updatedAt) ? { updatedAt: String(fromFsVal(f.updatedAt)) } : {}),
+  };
+}
+
 export class FirebaseRestBackend implements InviteStoreBackend {
-  private readonly cfg: FirebaseAppletConfig;
-  private readonly docsBase: string;
-  private readonly docPrefix: string;
+  readonly cfg: FirebaseAppletConfig;
+  readonly docsBase: string;
+  readonly docPrefix: string;
 
   constructor(cfg?: FirebaseAppletConfig) {
     this.cfg = cfg ?? loadFirebaseConfig();
@@ -267,12 +437,11 @@ export class FirebaseRestBackend implements InviteStoreBackend {
     };
   }
 
-  private async fetchDoc(relPath: string, idToken: string): Promise<FirestoreRestDoc | null> {
+  async fetchRawDoc(relPath: string, idToken: string): Promise<FirestoreRestDoc | null> {
     const res = await fetch(`${this.docsBase}/${relPath}`, {
       headers: { Authorization: `Bearer ${idToken}` },
     });
-    if (res.status === 404) return null;
-    if (res.status === 403) return null;
+    if (res.status === 404 || res.status === 403) return null;
     if (!res.ok) {
       const text = await res.text();
       throw new AuthServiceError(502, 'FIRESTORE_ERROR', `Firestore read failed: ${text}`);
@@ -281,14 +450,32 @@ export class FirebaseRestBackend implements InviteStoreBackend {
   }
 
   async getAdminDoc(uid: string, idToken: string): Promise<{ uid: string; role: UserRole } | null> {
-    const doc = await this.fetchDoc(`admins/${encodeURIComponent(uid)}`, idToken);
+    const doc = await this.fetchRawDoc(`admins/${encodeURIComponent(uid)}`, idToken);
     if (!doc?.fields) return null;
-    const roleVal = String(fromFsVal(doc.fields.role) ?? '');
-    if (roleVal !== 'owner' && roleVal !== 'admin') return null;
+    const roleVal = String(fromFsVal(doc.fields.role) ?? '').trim();
     return {
       uid: String(fromFsVal(doc.fields.uid) ?? uid),
-      role: roleVal,
+      role: (roleVal || 'unknown') as UserRole,
     };
+  }
+
+  async getUserDoc(uid: string, idToken: string): Promise<PlatformUserRecord | null> {
+    const doc = await this.fetchRawDoc(`users/${encodeURIComponent(uid)}`, idToken);
+    if (!doc?.fields) return null;
+    return docToUserProfile(doc);
+  }
+
+  async getTenantMember(
+    tenantId: string,
+    memberUid: string,
+    idToken: string
+  ): Promise<TenantMemberRecord | null> {
+    const doc = await this.fetchRawDoc(
+      `tenants/${encodeURIComponent(tenantId)}/members/${encodeURIComponent(memberUid)}`,
+      idToken
+    );
+    if (!doc?.fields) return null;
+    return docToTenantMember(doc);
   }
 
   async tenantExists(uid: string, idToken: string): Promise<boolean> {
@@ -297,7 +484,6 @@ export class FirebaseRestBackend implements InviteStoreBackend {
     });
     if (res.ok) return true;
 
-    // Fallback check for pre-existing tenants that already have subcollection business data
     const parentPath = `${this.docPrefix}/tenants/${uid}`;
     for (const collectionId of ['orders', 'products', 'customers', 'expenses']) {
       try {
@@ -379,6 +565,40 @@ export class FirebaseRestBackend implements InviteStoreBackend {
 
   async createInvitationDoc(record: InvitationRecord, idToken: string): Promise<InvitationRecord> {
     const invitePath = `${this.docPrefix}/invitations/${record.id}`;
+    const fields: Record<string, FirestoreJsonValue> = {
+      id: { stringValue: record.id },
+      codeHash: { stringValue: record.codeHash },
+      codePreview: { stringValue: record.codePreview },
+      label: { stringValue: record.label },
+      createdByUid: { stringValue: record.createdByUid },
+      status: { stringValue: 'active' },
+      maxUses: { integerValue: String(record.maxUses) },
+      usedCount: { integerValue: '0' },
+      expiresAt: { timestampValue: record.expiresAt },
+      resendCount: { integerValue: String(record.resendCount ?? 0) },
+    };
+    if (record.targetEmail) {
+      fields.targetEmail = { stringValue: record.targetEmail.trim().toLowerCase().slice(0, 160) };
+    }
+    if (record.targetFullName) {
+      fields.targetFullName = { stringValue: record.targetFullName.trim().slice(0, 120) };
+    }
+    if (record.targetBusinessName) {
+      fields.targetBusinessName = { stringValue: record.targetBusinessName.trim().slice(0, 100) };
+    }
+    if (
+      record.targetRole &&
+      ['store_owner', 'manager', 'staff', 'viewer'].includes(record.targetRole)
+    ) {
+      fields.targetRole = { stringValue: record.targetRole };
+    }
+    if (record.targetTenantId) {
+      fields.targetTenantId = { stringValue: record.targetTenantId.trim().slice(0, 128) };
+    }
+    if (record.targetPermissions) {
+      fields.targetPermissions = permissionsToFsMap(record.targetPermissions);
+    }
+
     const res = await fetch(`${this.docsBase}:commit`, {
       method: 'POST',
       headers: {
@@ -391,21 +611,14 @@ export class FirebaseRestBackend implements InviteStoreBackend {
             currentDocument: { exists: false },
             update: {
               name: invitePath,
-              fields: {
-                id: { stringValue: record.id },
-                codeHash: { stringValue: record.codeHash },
-                codePreview: { stringValue: record.codePreview },
-                label: { stringValue: record.label },
-                createdByUid: { stringValue: record.createdByUid },
-                status: { stringValue: 'active' },
-                maxUses: { integerValue: String(record.maxUses) },
-                usedCount: { integerValue: '0' },
-                expiresAt: { timestampValue: record.expiresAt },
-              },
+              fields,
             },
             updateTransforms: [
               { fieldPath: 'createdAt', setToServerValue: 'REQUEST_TIME' },
               { fieldPath: 'updatedAt', setToServerValue: 'REQUEST_TIME' },
+              ...(record.lastSentAt
+                ? [{ fieldPath: 'lastSentAt', setToServerValue: 'REQUEST_TIME' as const }]
+                : []),
             ],
           },
         ],
@@ -450,19 +663,11 @@ export class FirebaseRestBackend implements InviteStoreBackend {
             currentDocument: existing.updateTime
               ? { updateTime: existing.updateTime }
               : { exists: true },
+            updateMask: { fieldPaths: ['status'] },
             update: {
               name: invitePath,
               fields: {
-                id: { stringValue: existing.doc.id },
-                codeHash: { stringValue: existing.doc.codeHash },
-                codePreview: { stringValue: existing.doc.codePreview },
-                label: { stringValue: existing.doc.label },
-                createdByUid: { stringValue: existing.doc.createdByUid },
                 status: { stringValue: 'revoked' },
-                maxUses: { integerValue: String(existing.doc.maxUses) },
-                usedCount: { integerValue: String(existing.doc.usedCount) },
-                expiresAt: { timestampValue: existing.doc.expiresAt },
-                createdAt: { timestampValue: existing.doc.createdAt },
               },
             },
             updateTransforms: [
@@ -486,6 +691,54 @@ export class FirebaseRestBackend implements InviteStoreBackend {
     return fresh?.doc ?? { ...existing.doc, status: 'revoked' };
   }
 
+  async markInvitationResent(inviteId: string, idToken: string): Promise<InvitationRecord> {
+    const invitePath = `${this.docPrefix}/invitations/${inviteId}`;
+    const existing = await this.getInvitation(inviteId, idToken);
+    if (!existing) {
+      throw new AuthServiceError(404, 'INVITE_NOT_FOUND', 'Invitation not found.');
+    }
+    if (computeEffectiveInvitationStatus(existing.doc) !== 'active') {
+      throw new AuthServiceError(409, 'INVITE_NOT_ACTIVE', 'Only active invitations can be resent.');
+    }
+
+    const nextCount = Math.min(1000, (existing.doc.resendCount ?? 0) + 1);
+    const res = await fetch(`${this.docsBase}:commit`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${idToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        writes: [
+          {
+            currentDocument: existing.updateTime
+              ? { updateTime: existing.updateTime }
+              : { exists: true },
+            updateMask: { fieldPaths: ['resendCount'] },
+            update: {
+              name: invitePath,
+              fields: {
+                resendCount: { integerValue: String(nextCount) },
+              },
+            },
+            updateTransforms: [
+              { fieldPath: 'lastSentAt', setToServerValue: 'REQUEST_TIME' },
+              { fieldPath: 'updatedAt', setToServerValue: 'REQUEST_TIME' },
+            ],
+          },
+        ],
+      }),
+    });
+
+    if (!res.ok) {
+      const text = await res.text();
+      throw new AuthServiceError(502, 'FIRESTORE_ERROR', `Failed to update resend timestamp: ${text}`);
+    }
+
+    const fresh = await this.getInvitation(inviteId, idToken);
+    return fresh?.doc ?? { ...existing.doc, resendCount: nextCount };
+  }
+
   async commitRedemptionAndTenant(params: {
     invite: InvitationRecord;
     inviteUpdateTime?: string;
@@ -499,9 +752,137 @@ export class FirebaseRestBackend implements InviteStoreBackend {
     const nextStatus: InvitationStatus = nextUsedCount >= invite.maxUses ? 'used' : 'active';
     const provider = user.providerIds[0] || 'password';
 
+    const assignedRole: CanonicalRole =
+      invite.targetRole && ['store_owner', 'manager', 'staff', 'viewer'].includes(invite.targetRole)
+        ? invite.targetRole
+        : 'store_owner';
+    const isStoreMemberInvite =
+      assignedRole !== 'store_owner' && Boolean(invite.targetTenantId?.trim());
+    const assignedTenantId = isStoreMemberInvite ? invite.targetTenantId!.trim() : user.uid;
+    const assignedPermissions = invite.targetPermissions
+      ? sanitizePermissions(invite.targetPermissions, assignedRole)
+      : getDefaultPermissionsForRole(assignedRole);
+    const resolvedFullName = (fullName || invite.targetFullName || user.displayName || 'Merchant')
+      .trim()
+      .slice(0, 120);
+    const resolvedBusinessName = (
+      businessName ||
+      invite.targetBusinessName ||
+      `${resolvedFullName.split(' ')[0]}'s Store`
+    )
+      .trim()
+      .slice(0, 100);
+
     const invitePath = `${this.docPrefix}/invitations/${invite.id}`;
     const redemptionPath = `${this.docPrefix}/invitations/${invite.id}/redemptions/${user.uid}`;
+    const userPath = `${this.docPrefix}/users/${user.uid}`;
     const tenantPath = `${this.docPrefix}/tenants/${user.uid}`;
+    const memberPath = `${this.docPrefix}/tenants/${assignedTenantId}/members/${user.uid}`;
+
+    const userFields: Record<string, FirestoreJsonValue> = {
+      uid: { stringValue: user.uid },
+      email: { stringValue: user.email.toLowerCase().slice(0, 160) },
+      fullName: { stringValue: resolvedFullName },
+      photoUrl: { stringValue: (user.photoUrl || '').slice(0, 500) },
+      role: { stringValue: assignedRole },
+      accountStatus: { stringValue: 'active' },
+      tenantId: { stringValue: assignedTenantId },
+      businessName: { stringValue: resolvedBusinessName },
+      permissions: permissionsToFsMap(assignedPermissions),
+      invitationId: { stringValue: invite.id },
+    };
+    if (invite.createdByUid) {
+      userFields.createdByUid = { stringValue: invite.createdByUid };
+    }
+
+    const writes: Array<Record<string, unknown>> = [
+      {
+        currentDocument: inviteUpdateTime ? { updateTime: inviteUpdateTime } : { exists: true },
+        updateMask: { fieldPaths: ['status', 'usedCount'] },
+        update: {
+          name: invitePath,
+          fields: {
+            status: { stringValue: nextStatus },
+            usedCount: { integerValue: String(nextUsedCount) },
+          },
+        },
+        updateTransforms: [{ fieldPath: 'updatedAt', setToServerValue: 'REQUEST_TIME' }],
+      },
+      {
+        currentDocument: { exists: false },
+        update: {
+          name: redemptionPath,
+          fields: {
+            inviteId: { stringValue: invite.id },
+            uid: { stringValue: user.uid },
+            email: { stringValue: user.email.toLowerCase().slice(0, 160) },
+            displayName: { stringValue: resolvedFullName },
+            provider: { stringValue: provider.slice(0, 40) },
+          },
+        },
+        updateTransforms: [{ fieldPath: 'redeemedAt', setToServerValue: 'REQUEST_TIME' }],
+      },
+      {
+        currentDocument: { exists: false },
+        update: {
+          name: userPath,
+          fields: userFields,
+        },
+        updateTransforms: [
+          { fieldPath: 'createdAt', setToServerValue: 'REQUEST_TIME' },
+          { fieldPath: 'lastActiveAt', setToServerValue: 'REQUEST_TIME' },
+          { fieldPath: 'updatedAt', setToServerValue: 'REQUEST_TIME' },
+        ],
+      },
+    ];
+
+    if (isStoreMemberInvite) {
+      writes.push({
+        currentDocument: { exists: false },
+        update: {
+          name: memberPath,
+          fields: {
+            uid: { stringValue: user.uid },
+            tenantId: { stringValue: assignedTenantId },
+            email: { stringValue: user.email.toLowerCase().slice(0, 160) },
+            fullName: { stringValue: resolvedFullName },
+            role: { stringValue: assignedRole },
+            accountStatus: { stringValue: 'active' },
+            permissions: permissionsToFsMap(assignedPermissions),
+            ...(invite.createdByUid ? { invitedByUid: { stringValue: invite.createdByUid } } : {}),
+          },
+        },
+        updateTransforms: [
+          { fieldPath: 'createdAt', setToServerValue: 'REQUEST_TIME' },
+          { fieldPath: 'updatedAt', setToServerValue: 'REQUEST_TIME' },
+        ],
+      });
+    } else {
+      writes.push({
+        currentDocument: { exists: false },
+        update: {
+          name: tenantPath,
+          fields: {
+            ownerId: { stringValue: user.uid },
+            businessName: { stringValue: resolvedBusinessName },
+            ownerEmail: { stringValue: user.email.toLowerCase().slice(0, 160) },
+            fullName: { stringValue: resolvedFullName },
+            photoUrl: { stringValue: (user.photoUrl || '').slice(0, 500) },
+            role: { stringValue: 'store_owner' },
+            accountStatus: { stringValue: 'active' },
+            invitationId: { stringValue: invite.id },
+            currency: { stringValue: 'USD' },
+            usdToEgpRate: { doubleValue: 50 },
+            taxRate: { doubleValue: 8.25 },
+            lowStockThreshold: { integerValue: '12' },
+          },
+        },
+        updateTransforms: [
+          { fieldPath: 'createdAt', setToServerValue: 'REQUEST_TIME' },
+          { fieldPath: 'updatedAt', setToServerValue: 'REQUEST_TIME' },
+        ],
+      });
+    }
 
     const res = await fetch(`${this.docsBase}:commit`, {
       method: 'POST',
@@ -509,67 +890,7 @@ export class FirebaseRestBackend implements InviteStoreBackend {
         Authorization: `Bearer ${idToken}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({
-        writes: [
-          {
-            currentDocument: inviteUpdateTime ? { updateTime: inviteUpdateTime } : { exists: true },
-            update: {
-              name: invitePath,
-              fields: {
-                id: { stringValue: invite.id },
-                codeHash: { stringValue: invite.codeHash },
-                codePreview: { stringValue: invite.codePreview },
-                label: { stringValue: invite.label },
-                createdByUid: { stringValue: invite.createdByUid },
-                status: { stringValue: nextStatus },
-                maxUses: { integerValue: String(invite.maxUses) },
-                usedCount: { integerValue: String(nextUsedCount) },
-                expiresAt: { timestampValue: invite.expiresAt },
-                createdAt: { timestampValue: invite.createdAt },
-              },
-            },
-            updateTransforms: [{ fieldPath: 'updatedAt', setToServerValue: 'REQUEST_TIME' }],
-          },
-          {
-            currentDocument: { exists: false },
-            update: {
-              name: redemptionPath,
-              fields: {
-                inviteId: { stringValue: invite.id },
-                uid: { stringValue: user.uid },
-                email: { stringValue: user.email.slice(0, 160) },
-                displayName: { stringValue: fullName.slice(0, 120) },
-                provider: { stringValue: provider.slice(0, 40) },
-              },
-            },
-            updateTransforms: [{ fieldPath: 'redeemedAt', setToServerValue: 'REQUEST_TIME' }],
-          },
-          {
-            currentDocument: { exists: false },
-            update: {
-              name: tenantPath,
-              fields: {
-                ownerId: { stringValue: user.uid },
-                businessName: { stringValue: businessName.slice(0, 100) },
-                ownerEmail: { stringValue: user.email.slice(0, 160) },
-                fullName: { stringValue: fullName.slice(0, 120) },
-                photoUrl: { stringValue: (user.photoUrl || '').slice(0, 500) },
-                role: { stringValue: 'user' },
-                accountStatus: { stringValue: 'active' },
-                invitationId: { stringValue: invite.id },
-                currency: { stringValue: 'USD' },
-                usdToEgpRate: { doubleValue: 50 },
-                taxRate: { doubleValue: 8.25 },
-                lowStockThreshold: { integerValue: '12' },
-              },
-            },
-            updateTransforms: [
-              { fieldPath: 'createdAt', setToServerValue: 'REQUEST_TIME' },
-              { fieldPath: 'updatedAt', setToServerValue: 'REQUEST_TIME' },
-            ],
-          },
-        ],
-      }),
+      body: JSON.stringify({ writes }),
     });
 
     if (!res.ok) {
@@ -603,10 +924,215 @@ export class FirebaseRestBackend implements InviteStoreBackend {
         inviteId: invite.id,
         uid: user.uid,
         email: user.email,
-        displayName: fullName,
+        displayName: resolvedFullName,
         provider,
         redeemedAt: nowIso,
       },
+    };
+  }
+
+  async listUsersDocs(idToken: string): Promise<PlatformUserRecord[]> {
+    const res = await fetch(`${this.docsBase}/users?pageSize=300`, {
+      headers: { Authorization: `Bearer ${idToken}` },
+    });
+    if (res.status === 403) {
+      throw new AuthServiceError(403, 'SUPER_ADMIN_REQUIRED', 'Super Admin permissions are required.');
+    }
+    if (!res.ok) {
+      const text = await res.text();
+      throw new AuthServiceError(502, 'FIRESTORE_ERROR', `Failed to list users: ${text}`);
+    }
+    const json = (await res.json()) as { documents?: FirestoreRestDoc[] };
+    return (json.documents ?? []).map(docToUserProfile);
+  }
+
+  async listTenantDocs(idToken: string): Promise<Array<TenantProfile & { tenantId: string }>> {
+    const res = await fetch(`${this.docsBase}/tenants?pageSize=300`, {
+      headers: { Authorization: `Bearer ${idToken}` },
+    });
+    if (res.status === 403) {
+      throw new AuthServiceError(403, 'SUPER_ADMIN_REQUIRED', 'Super Admin permissions are required.');
+    }
+    if (!res.ok) {
+      const text = await res.text();
+      throw new AuthServiceError(502, 'FIRESTORE_ERROR', `Failed to list tenants: ${text}`);
+    }
+    const json = (await res.json()) as { documents?: FirestoreRestDoc[] };
+    return (json.documents ?? []).map(docToTenantProfile);
+  }
+
+  async getTenantDoc(tenantId: string, idToken: string): Promise<(TenantProfile & { tenantId: string }) | null> {
+    const raw = await this.fetchRawDoc(`tenants/${encodeURIComponent(tenantId)}`, idToken);
+    if (!raw?.fields) return null;
+    return docToTenantProfile(raw);
+  }
+
+  async listTenantMembers(tenantId: string, idToken: string): Promise<TenantMemberRecord[]> {
+    const res = await fetch(`${this.docsBase}/tenants/${encodeURIComponent(tenantId)}/members?pageSize=200`, {
+      headers: { Authorization: `Bearer ${idToken}` },
+    });
+    if (!res.ok) return [];
+    const json = (await res.json()) as { documents?: FirestoreRestDoc[] };
+    return (json.documents ?? []).map(docToTenantMember);
+  }
+
+  async countCollectionDocs(relCollectionPath: string, idToken: string): Promise<number> {
+    const res = await fetch(`${this.docsBase}/${relCollectionPath}?pageSize=500`, {
+      headers: { Authorization: `Bearer ${idToken}` },
+    });
+    if (!res.ok) return 0;
+    const json = (await res.json()) as { documents?: FirestoreRestDoc[] };
+    return (json.documents ?? []).length;
+  }
+
+  async createAuditLogDoc(entry: Omit<AdminAuditLogEntry, 'createdAt'>, idToken: string): Promise<AdminAuditLogEntry> {
+    const logPath = `${this.docPrefix}/adminAuditLogs/${entry.id}`;
+    const res = await fetch(`${this.docsBase}:commit`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${idToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        writes: [
+          {
+            currentDocument: { exists: false },
+            update: {
+              name: logPath,
+              fields: {
+                id: { stringValue: entry.id },
+                actorUid: { stringValue: entry.actorUid },
+                actorEmail: { stringValue: entry.actorEmail.slice(0, 160) },
+                action: { stringValue: entry.action.slice(0, 80) },
+                targetType: { stringValue: entry.targetType },
+                targetId: { stringValue: entry.targetId.slice(0, 128) },
+                targetLabel: { stringValue: entry.targetLabel.slice(0, 160) },
+                details: { stringValue: entry.details.slice(0, 500) },
+              },
+            },
+            updateTransforms: [{ fieldPath: 'createdAt', setToServerValue: 'REQUEST_TIME' }],
+          },
+        ],
+      }),
+    });
+
+    if (!res.ok) {
+      const text = await res.text();
+      if (res.status === 403) {
+        throw new AuthServiceError(403, 'SUPER_ADMIN_REQUIRED', 'Super Admin permissions are required to write audit logs.');
+      }
+      throw new AuthServiceError(502, 'FIRESTORE_ERROR', `Failed to record audit log: ${text}`);
+    }
+
+    return {
+      ...entry,
+      createdAt: new Date().toISOString(),
+    };
+  }
+
+  async listAuditLogsDocs(idToken: string): Promise<AdminAuditLogEntry[]> {
+    const res = await fetch(`${this.docsBase}/adminAuditLogs?pageSize=200`, {
+      headers: { Authorization: `Bearer ${idToken}` },
+    });
+    if (res.status === 403) {
+      throw new AuthServiceError(403, 'SUPER_ADMIN_REQUIRED', 'Super Admin permissions are required.');
+    }
+    if (!res.ok) {
+      const text = await res.text();
+      throw new AuthServiceError(502, 'FIRESTORE_ERROR', `Failed to load audit logs: ${text}`);
+    }
+    const json = (await res.json()) as { documents?: FirestoreRestDoc[] };
+    return (json.documents ?? [])
+      .map((doc): AdminAuditLogEntry => {
+        const f = doc.fields ?? {};
+        const idFromName = doc.name?.split('/').pop() ?? '';
+        return {
+          id: String(fromFsVal(f.id) ?? idFromName),
+          actorUid: String(fromFsVal(f.actorUid) ?? ''),
+          actorEmail: String(fromFsVal(f.actorEmail) ?? ''),
+          action: String(fromFsVal(f.action) ?? ''),
+          targetType: String(fromFsVal(f.targetType) ?? 'system') as AdminAuditLogEntry['targetType'],
+          targetId: String(fromFsVal(f.targetId) ?? ''),
+          targetLabel: String(fromFsVal(f.targetLabel) ?? ''),
+          details: String(fromFsVal(f.details) ?? ''),
+          createdAt: String(fromFsVal(f.createdAt) ?? doc.createTime ?? ''),
+        };
+      })
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  async listRoleTemplatesDocs(idToken: string): Promise<RoleTemplateRecord[]> {
+    const res = await fetch(`${this.docsBase}/roleTemplates?pageSize=20`, {
+      headers: { Authorization: `Bearer ${idToken}` },
+    });
+    if (!res.ok) return [];
+    const json = (await res.json()) as { documents?: FirestoreRestDoc[] };
+    return (json.documents ?? []).map((doc): RoleTemplateRecord => {
+      const f = doc.fields ?? {};
+      const role = normalizeCanonicalRole(String(fromFsVal(f.role) ?? 'viewer'), 'tenant');
+      return {
+        role,
+        label: String(fromFsVal(f.label) ?? role),
+        description: String(fromFsVal(f.description) ?? ''),
+        permissions: sanitizePermissions(fromFsVal(f.permissions), role),
+        ...(fromFsVal(f.updatedAt) ? { updatedAt: String(fromFsVal(f.updatedAt)) } : {}),
+        ...(fromFsVal(f.updatedByUid) ? { updatedByUid: String(fromFsVal(f.updatedByUid)) } : {}),
+      };
+    });
+  }
+
+  async upsertRoleTemplateDoc(
+    template: RoleTemplateRecord & { updatedByUid: string },
+    idToken: string
+  ): Promise<RoleTemplateRecord> {
+    const templatePath = `${this.docPrefix}/roleTemplates/${template.role}`;
+    const existing = await this.fetchRawDoc(`roleTemplates/${template.role}`, idToken);
+
+    const write = existing
+      ? {
+          currentDocument: { exists: true },
+          updateMask: { fieldPaths: ['label', 'description', 'permissions', 'updatedByUid'] },
+          update: {
+            name: templatePath,
+            fields: {
+              label: { stringValue: template.label.slice(0, 80) },
+              description: { stringValue: template.description.slice(0, 240) },
+              permissions: permissionsToFsMap(template.permissions),
+              updatedByUid: { stringValue: template.updatedByUid },
+            },
+          },
+          updateTransforms: [{ fieldPath: 'updatedAt', setToServerValue: 'REQUEST_TIME' }],
+        }
+      : {
+          currentDocument: { exists: false },
+          update: {
+            name: templatePath,
+            fields: {
+              role: { stringValue: template.role },
+              label: { stringValue: template.label.slice(0, 80) },
+              description: { stringValue: template.description.slice(0, 240) },
+              permissions: permissionsToFsMap(template.permissions),
+              updatedByUid: { stringValue: template.updatedByUid },
+            },
+          },
+          updateTransforms: [{ fieldPath: 'updatedAt', setToServerValue: 'REQUEST_TIME' }],
+        };
+
+    const res = await fetch(`${this.docsBase}:commit`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${idToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ writes: [write] }),
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new AuthServiceError(502, 'FIRESTORE_ERROR', `Failed to save role template: ${text}`);
+    }
+    return {
+      ...template,
+      updatedAt: new Date().toISOString(),
     };
   }
 }
@@ -623,7 +1149,7 @@ export class AuthServiceError extends Error {
 }
 
 export class AuthInviteService {
-  private readonly backend: InviteStoreBackend;
+  readonly backend: InviteStoreBackend;
   private readonly rateLimiter: AttemptRateLimiter;
   private readonly persistCache: boolean;
   private readonly inviteCache = new Map<string, InvitationRecord>();
@@ -689,7 +1215,7 @@ export class AuthInviteService {
     }
   }
 
-  private isEnvOwnerUid(uid: string): boolean {
+  isEnvOwnerUid(uid: string): boolean {
     const raw = process.env.ZENORATI_OWNER_UID ?? '';
     if (!raw.trim()) return false;
     const allowlist = raw
@@ -711,38 +1237,136 @@ export class AuthInviteService {
     return allowlist.includes(normalized);
   }
 
-  private async resolveAdminStatus(
+  async resolveAdminStatus(
     user: VerifiedFirebaseUser,
     idToken: string
-  ): Promise<{ isAdmin: boolean; role: UserRole }> {
+  ): Promise<{
+    isAdmin: boolean;
+    isSuperAdmin: boolean;
+    diagnostic: SuperAdminDiagnostic;
+  }> {
+    const envOwnerUidMatched = this.isEnvOwnerUid(user.uid);
     if (!user.emailVerified) {
-      return { isAdmin: false, role: 'user' };
+      return {
+        isAdmin: false,
+        isSuperAdmin: false,
+        diagnostic: {
+          hasAdminDoc: false,
+          adminDocRole: null,
+          envOwnerUidMatched,
+          reason: 'email_unverified',
+        },
+      };
     }
+
     const adminDoc = await this.backend.getAdminDoc(user.uid, idToken);
-    if (adminDoc) {
-      return { isAdmin: true, role: adminDoc.role };
+    if (!adminDoc) {
+      // Email-only matching or env-only UID matching NEVER grants Super Admin without /admins/{uid}.
+      return {
+        isAdmin: false,
+        isSuperAdmin: false,
+        diagnostic: {
+          hasAdminDoc: false,
+          adminDocRole: null,
+          envOwnerUidMatched,
+          reason: 'missing_admin_doc',
+        },
+      };
     }
-    if (this.isEnvOwnerUid(user.uid) || this.isEnvOwnerEmail(user.email, user.emailVerified)) {
-      return { isAdmin: true, role: 'owner' };
+
+    if (adminDoc.role === 'super_admin' || adminDoc.role === 'owner') {
+      return {
+        isAdmin: true,
+        isSuperAdmin: true,
+        diagnostic: {
+          hasAdminDoc: true,
+          adminDocRole: adminDoc.role,
+          envOwnerUidMatched,
+          reason: 'verified_admin_doc',
+        },
+      };
     }
-    return { isAdmin: false, role: 'user' };
+
+    // Legacy 'admin' or malformed /admins/{uid} role cannot pass firestore.rules isSuperAdmin()
+    return {
+      isAdmin: adminDoc.role === 'admin',
+      isSuperAdmin: false,
+      diagnostic: {
+        hasAdminDoc: true,
+        adminDocRole: adminDoc.role,
+        envOwnerUidMatched,
+        reason: 'role_insufficient',
+      },
+    };
   }
 
   async getSessionInfo(idToken: string): Promise<AuthSessionInfo> {
     const user = await this.backend.verifyIdToken(idToken);
-    const [{ isAdmin, role }, hasTenant] = await Promise.all([
+    const [adminStatus, userDoc, hasOwnTenant] = await Promise.all([
       this.resolveAdminStatus(user, idToken),
+      this.backend.getUserDoc(user.uid, idToken),
       this.backend.tenantExists(user.uid, idToken),
     ]);
+
+    const { isAdmin, isSuperAdmin, diagnostic } = adminStatus;
+
+    let role: CanonicalRole = isSuperAdmin ? 'super_admin' : 'store_owner';
+    let accountStatus: AccountStatus = 'active';
+    let tenantId: string | null = hasOwnTenant ? user.uid : null;
+    let permissions: SectionPermissions = getDefaultPermissionsForRole(role);
+    let hasTenant = hasOwnTenant;
+
+    if (userDoc) {
+      accountStatus = userDoc.accountStatus;
+      if (isSuperAdmin) {
+        role = 'super_admin';
+        permissions = getDefaultPermissionsForRole('super_admin');
+        tenantId = userDoc.tenantId ?? (hasOwnTenant ? user.uid : null);
+      } else {
+        role = userDoc.role === 'super_admin' ? 'store_owner' : userDoc.role;
+        permissions = sanitizePermissions(userDoc.permissions, role);
+        tenantId = userDoc.tenantId ?? (hasOwnTenant ? user.uid : null);
+        if (tenantId && tenantId !== user.uid) {
+          const member = await this.backend.getTenantMember(tenantId, user.uid, idToken);
+          if (member) {
+            if (member.accountStatus === 'suspended') {
+              accountStatus = 'suspended';
+            }
+            role = member.role;
+            permissions = sanitizePermissions(member.permissions, role);
+            hasTenant = true;
+          } else {
+            hasTenant = false;
+          }
+        } else if (tenantId === user.uid && !hasOwnTenant) {
+          hasTenant = await this.backend.tenantExists(user.uid, idToken);
+        } else if (tenantId === user.uid) {
+          hasTenant = true;
+        }
+      }
+    }
+
+    const legacyOwnerShellAccess =
+      !hasTenant && !isSuperAdmin && this.isEnvOwnerEmail(user.email, user.emailVerified);
+
     return {
       ...user,
       isAdmin,
+      isSuperAdmin,
       role,
+      accountStatus,
+      tenantId,
+      permissions,
       hasTenant,
+      ...(legacyOwnerShellAccess ? { legacyOwnerShellAccess: true } : {}),
+      superAdminDiagnostic: diagnostic,
     };
   }
 
-  private assertInviteRedeemable(record: InvitationRecord | null): asserts record is InvitationRecord {
+  private assertInviteRedeemable(
+    record: InvitationRecord | null,
+    userEmail?: string
+  ): asserts record is InvitationRecord {
     if (!record) {
       throw new AuthServiceError(
         404,
@@ -772,18 +1396,29 @@ export class AuthInviteService {
         'This invitation has already reached its usage limit.'
       );
     }
+    if (
+      userEmail &&
+      record.targetEmail &&
+      record.targetEmail.trim().length > 0 &&
+      record.targetEmail.trim().toLowerCase() !== userEmail.trim().toLowerCase()
+    ) {
+      throw new AuthServiceError(
+        403,
+        'INVITE_EMAIL_MISMATCH',
+        'This invitation is restricted to a different email address.'
+      );
+    }
   }
 
-  /**
-   * Unauthenticated pre-check run BEFORE opening Google popup or creating an Email/Password account.
-   * Rate-limited strictly to prevent brute-force guessing.
-   */
   checkInvitationPreAuth(code: string, clientKey: string): {
     valid: boolean;
     verifiedByCache: boolean;
     codePreview?: string;
     remainingUses?: number;
     expiresAt?: string;
+    targetRole?: CanonicalRole;
+    targetFullName?: string;
+    targetBusinessName?: string;
   } {
     const rate = this.rateLimiter.check(`ip:${clientKey}`);
     if (!rate.allowed) {
@@ -828,6 +1463,9 @@ export class AuthInviteService {
         codePreview: cached.codePreview,
         remainingUses: Math.max(0, cached.maxUses - cached.usedCount),
         expiresAt: cached.expiresAt,
+        ...(cached.targetRole ? { targetRole: cached.targetRole } : {}),
+        ...(cached.targetFullName ? { targetFullName: cached.targetFullName } : {}),
+        ...(cached.targetBusinessName ? { targetBusinessName: cached.targetBusinessName } : {}),
       };
     }
 
@@ -840,17 +1478,12 @@ export class AuthInviteService {
       );
     }
 
-    // Cold server cache before an admin has hydrated it: allow Auth step to obtain idToken so
-    // verifyInvitationAuthenticated / redeemInvitationAndCreateTenant performs authoritative Firestore verification & rollback on failure.
     return {
       valid: true,
       verifiedByCache: false,
     };
   }
 
-  /**
-   * Authoritative Firestore check for signed-in users (including newly created email/password accounts before email verification).
-   */
   async verifyInvitationAuthenticated(params: {
     idToken: string;
     code: string;
@@ -860,6 +1493,7 @@ export class AuthInviteService {
     codePreview: string;
     remainingUses: number;
     expiresAt: string;
+    targetRole?: CanonicalRole;
   }> {
     const user = await this.backend.verifyIdToken(params.idToken);
     const ipRate = this.rateLimiter.check(`ip:${params.clientKey}`);
@@ -894,7 +1528,7 @@ export class AuthInviteService {
     }
 
     try {
-      this.assertInviteRedeemable(fetched.doc);
+      this.assertInviteRedeemable(fetched.doc, user.email);
     } catch (err) {
       this.inviteCache.set(fetched.doc.id, fetched.doc);
       this.writeDiskCache();
@@ -911,6 +1545,7 @@ export class AuthInviteService {
       codePreview: fetched.doc.codePreview,
       remainingUses: Math.max(0, fetched.doc.maxUses - fetched.doc.usedCount),
       expiresAt: fetched.doc.expiresAt,
+      ...(fetched.doc.targetRole ? { targetRole: fetched.doc.targetRole } : {}),
     };
   }
 
@@ -939,9 +1574,17 @@ export class AuthInviteService {
       );
     }
 
-    // Existing users with an active tenant doc retain access without consuming any new invitation
-    const hasTenant = await this.backend.tenantExists(user.uid, params.idToken);
-    if (hasTenant) {
+    const existingUserDoc = await this.backend.getUserDoc(user.uid, params.idToken);
+    if (existingUserDoc?.accountStatus === 'suspended') {
+      throw new AuthServiceError(
+        403,
+        'ACCOUNT_SUSPENDED',
+        'This account has been suspended by the platform administrator.'
+      );
+    }
+
+    const hasOwnTenant = await this.backend.tenantExists(user.uid, params.idToken);
+    if (hasOwnTenant || (existingUserDoc && existingUserDoc.tenantId)) {
       return { alreadyActive: true, user };
     }
 
@@ -988,7 +1631,7 @@ export class AuthInviteService {
       }
 
       try {
-        this.assertInviteRedeemable(fetched.doc);
+        this.assertInviteRedeemable(fetched.doc, user.email);
       } catch (err) {
         this.inviteCache.set(fetched.doc.id, fetched.doc);
         this.writeDiskCache();
@@ -998,12 +1641,20 @@ export class AuthInviteService {
       }
 
       const cleanFullName =
-        (params.fullName ?? user.displayName ?? user.email.split('@')[0] ?? 'Merchant')
+        (
+          params.fullName ??
+          fetched.doc.targetFullName ??
+          user.displayName ??
+          user.email.split('@')[0] ??
+          'Merchant'
+        )
           .trim()
           .slice(0, 120) || 'Merchant';
       const defaultBiz = `${cleanFullName.split(' ')[0]}'s Store`;
       const cleanBusinessName =
-        (params.businessName ?? defaultBiz).trim().slice(0, 100) || 'ZENORATI Store';
+        (params.businessName ?? fetched.doc.targetBusinessName ?? defaultBiz)
+          .trim()
+          .slice(0, 100) || 'ZENORATI Store';
 
       const result = await this.backend.commitRedemptionAndTenant({
         invite: fetched.doc,
@@ -1028,15 +1679,30 @@ export class AuthInviteService {
     });
   }
 
-  private async requireAdmin(idToken: string): Promise<VerifiedFirebaseUser> {
+  async requireAdmin(idToken: string): Promise<VerifiedFirebaseUser> {
     const user = await this.backend.verifyIdToken(idToken);
     const { isAdmin } = await this.resolveAdminStatus(user, idToken);
     if (!isAdmin) {
       throw new AuthServiceError(
         403,
         'ADMIN_REQUIRED',
-        'Only an authorized platform owner or administrator can manage invitations.'
+        'Only an authorized administrator with a verified /admins/{uid} document can manage invitations.'
       );
+    }
+    return user;
+  }
+
+  async requireSuperAdmin(idToken: string): Promise<VerifiedFirebaseUser> {
+    const user = await this.backend.verifyIdToken(idToken);
+    const { isSuperAdmin, diagnostic } = await this.resolveAdminStatus(user, idToken);
+    if (!isSuperAdmin) {
+      const detail =
+        diagnostic.reason === 'missing_admin_doc'
+          ? `Super Admin verification requires a Firestore /admins/${user.uid} document with role "super_admin" or "owner".`
+          : diagnostic.reason === 'role_insufficient'
+          ? `Firestore /admins/${user.uid} has role "${diagnostic.adminDocRole}", which is insufficient for Super Admin access.`
+          : 'Your Firebase email address must be verified before Super Admin access is granted.';
+      throw new AuthServiceError(403, 'SUPER_ADMIN_REQUIRED', detail);
     }
     return user;
   }
@@ -1046,6 +1712,12 @@ export class AuthInviteService {
     maxUses: number;
     expiresAtIso: string;
     label?: string;
+    targetEmail?: string;
+    targetFullName?: string;
+    targetBusinessName?: string;
+    targetRole?: CanonicalRole;
+    targetTenantId?: string;
+    targetPermissions?: SectionPermissions;
   }): Promise<{ inviteCode: string; invitation: InvitationRecord }> {
     const adminUser = await this.requireAdmin(params.idToken);
 
@@ -1067,6 +1739,11 @@ export class AuthInviteService {
       );
     }
 
+    const cleanRole: CanonicalRole | undefined =
+      params.targetRole && ['store_owner', 'manager', 'staff', 'viewer'].includes(params.targetRole)
+        ? params.targetRole
+        : undefined;
+
     const inviteCode = generateRandomInvitationCode();
     const codeHash = hashInvitationCode(inviteCode);
     const nowIso = new Date().toISOString();
@@ -1083,6 +1760,23 @@ export class AuthInviteService {
       expiresAt: new Date(expMs).toISOString(),
       createdAt: nowIso,
       updatedAt: nowIso,
+      resendCount: 0,
+      ...(params.targetEmail?.trim()
+        ? { targetEmail: params.targetEmail.trim().toLowerCase().slice(0, 160) }
+        : {}),
+      ...(params.targetFullName?.trim()
+        ? { targetFullName: params.targetFullName.trim().slice(0, 120) }
+        : {}),
+      ...(params.targetBusinessName?.trim()
+        ? { targetBusinessName: params.targetBusinessName.trim().slice(0, 100) }
+        : {}),
+      ...(cleanRole ? { targetRole: cleanRole } : {}),
+      ...(params.targetTenantId?.trim()
+        ? { targetTenantId: params.targetTenantId.trim().slice(0, 128) }
+        : {}),
+      ...(params.targetPermissions
+        ? { targetPermissions: sanitizePermissions(params.targetPermissions, cleanRole ?? 'store_owner') }
+        : {}),
     };
 
     const persisted = await this.backend.createInvitationDoc(record, params.idToken);
@@ -1127,6 +1821,11 @@ export class AuthInviteService {
     this.inviteCache.set(revoked.id, revoked);
     this.writeDiskCache();
     return revoked;
+  }
+
+  updateCachedInvitation(record: InvitationRecord): void {
+    this.inviteCache.set(record.id, record);
+    this.writeDiskCache();
   }
 }
 

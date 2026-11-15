@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { onAuthStateChanged, signInWithPopup, signOut, type User } from 'firebase/auth';
 import { motion, AnimatePresence } from 'motion/react';
+import { LogOut, ShieldAlert } from 'lucide-react';
 import { auth, googleProvider } from './lib/firebase';
 import type {
   ActivityType,
@@ -48,6 +49,7 @@ import {
   cloudUpdateOrder,
   cloudUpdateOrderStatus,
   cloudUpdateProfile,
+  ensureExistingOwnerUserProfile,
   fetchExistingCloudTenantProfile,
   loadLocalWorkspace,
   LOCAL_TENANT_ID,
@@ -55,6 +57,7 @@ import {
   saveLocalWorkspace,
   seedCloudWorkspace,
   subscribeCloudWorkspace,
+  touchUserLastActive,
 } from './services/tenantStore';
 import {
   fetchServerSessionInfo,
@@ -62,6 +65,11 @@ import {
 } from './services/authInviteClient';
 import { computeDashboardMetrics } from './utils/analytics';
 import { createSafeId } from './utils/formatters';
+import {
+  getDefaultPermissionsForRole,
+  hasSectionPermission,
+  navSectionToPermissionSection,
+} from './utils/permissions';
 import {
   buildHistoryEntry,
   computeDeleteOrderStockPlan,
@@ -79,6 +87,7 @@ import {
   getPendingInviteActivation,
 } from './components/AuthPortal';
 import { AdminInvitationsView, UserProfileView } from './components/AccountAndAdminViews';
+import { SuperAdminDashboardView } from './components/SuperAdminDashboardView';
 import { DashboardView } from './components/DashboardView';
 import { ProductsView } from './components/ProductsView';
 import { OrdersView } from './components/OrdersView';
@@ -133,7 +142,7 @@ export default function App() {
   const [firebaseUser, setFirebaseUser] = useState<User | null>(null);
   const [sessionInfo, setSessionInfo] = useState<AuthSessionInfo | null>(null);
   const [workspaceGate, setWorkspaceGate] = useState<
-    'loading' | 'active' | 'verify_email' | 'needs_activation'
+    'loading' | 'active' | 'verify_email' | 'needs_activation' | 'suspended'
   >('loading');
   const [authGateError, setAuthGateError] = useState<string | null>(null);
   const [sessionNonce, setSessionNonce] = useState(0);
@@ -161,7 +170,13 @@ export default function App() {
   );
   const lastSyncedCbeSigRef = useRef<string>('');
 
-  const isAdmin = Boolean(sessionInfo?.isAdmin);
+  const isSuperAdmin = Boolean(sessionInfo?.isSuperAdmin);
+  const isAdmin = Boolean(sessionInfo?.isAdmin || sessionInfo?.isSuperAdmin);
+  const userRole = sessionInfo?.role ?? 'store_owner';
+  const userPermissions = useMemo(
+    () => sessionInfo?.permissions ?? getDefaultPermissionsForRole(userRole),
+    [sessionInfo?.permissions, userRole]
+  );
   const isCloudMode = authReady && firebaseUser !== null && workspaceGate === 'active';
 
   const triggerSessionRefresh = useCallback(async () => {
@@ -215,9 +230,16 @@ export default function App() {
 
     const resolveSessionAndWorkspace = async () => {
       const idToken = await firebaseUser.getIdToken();
-      const [serverSession, existingProfile] = await Promise.all([
-        fetchServerSessionInfo(idToken).catch(
-          (): AuthSessionInfo => ({
+      const [serverSession, ownProfile] = await Promise.all([
+        fetchServerSessionInfo(idToken).catch((sessionErr): AuthSessionInfo => {
+          if (!cancelled) {
+            setErrorBanner(
+              sessionErr instanceof Error
+                ? `Session verification failed: ${sessionErr.message}`
+                : 'Session verification failed.'
+            );
+          }
+          return {
             uid: firebaseUser.uid,
             email: firebaseUser.email ?? '',
             emailVerified: firebaseUser.emailVerified,
@@ -226,18 +248,41 @@ export default function App() {
             createdAt: firebaseUser.metadata.creationTime ?? null,
             providerIds: firebaseUser.providerData.map((p) => p.providerId),
             isAdmin: false,
-            role: 'user',
+            isSuperAdmin: false,
+            role: 'store_owner',
+            accountStatus: 'active',
+            tenantId: null,
+            permissions: getDefaultPermissionsForRole('store_owner'),
             hasTenant: false,
-          })
-        ),
+            legacyOwnerShellAccess: false,
+            superAdminDiagnostic: {
+              hasAdminDoc: false,
+              adminDocRole: null,
+              envOwnerUidMatched: false,
+              reason: 'missing_admin_doc',
+            },
+          };
+        }),
         fetchExistingCloudTenantProfile(firebaseUser.uid),
       ]);
 
       if (cancelled) return;
       setSessionInfo(serverSession);
 
-      let initialProfile = existingProfile;
-      let docExists = Boolean(existingProfile);
+      if (serverSession.accountStatus === 'suspended') {
+        setWorkspaceGate('suspended');
+        setCloudLoading(false);
+        return;
+      }
+
+      let resolvedTenantId = serverSession.tenantId || firebaseUser.uid;
+      let initialProfile = ownProfile;
+      if (!initialProfile && resolvedTenantId !== firebaseUser.uid) {
+        initialProfile = await fetchExistingCloudTenantProfile(resolvedTenantId);
+      }
+      if (cancelled) return;
+
+      let docExists = Boolean(initialProfile);
 
       if (!initialProfile) {
         const pending = getPendingInviteActivation(firebaseUser.uid);
@@ -250,7 +295,16 @@ export default function App() {
               businessName: pending.businessName || undefined,
             });
             clearPendingInviteActivation(firebaseUser.uid);
-            initialProfile = await fetchExistingCloudTenantProfile(firebaseUser.uid);
+            const refreshedSession = await fetchServerSessionInfo(idToken).catch(() => serverSession);
+            if (cancelled) return;
+            setSessionInfo(refreshedSession);
+            if (refreshedSession.accountStatus === 'suspended') {
+              setWorkspaceGate('suspended');
+              setCloudLoading(false);
+              return;
+            }
+            resolvedTenantId = refreshedSession.tenantId || firebaseUser.uid;
+            initialProfile = await fetchExistingCloudTenantProfile(resolvedTenantId);
             docExists = Boolean(initialProfile);
           } catch (redeemErr) {
             clearPendingInviteActivation(firebaseUser.uid);
@@ -265,19 +319,24 @@ export default function App() {
             }
             return;
           }
-        } else if (serverSession.isAdmin || serverSession.hasTenant) {
+        } else if (
+          serverSession.isSuperAdmin ||
+          serverSession.isAdmin ||
+          serverSession.hasTenant ||
+          serverSession.legacyOwnerShellAccess
+        ) {
           // Never auto-create or overwrite a missing /tenants/{uid} document for an existing owner/tenant.
           // Provide a read-only in-memory shell so the owner can inspect their UID, admin tools, or legacy subcollections without triggering Firestore writes.
           docExists = false;
           initialProfile = {
-            ownerId: firebaseUser.uid,
+            ownerId: resolvedTenantId,
             businessName: firebaseUser.displayName
               ? `${firebaseUser.displayName.split(' ')[0]}'s Store`
               : 'ZENORATI Store',
             ownerEmail: firebaseUser.email || '',
             ...(firebaseUser.displayName ? { fullName: firebaseUser.displayName } : {}),
             role: serverSession.role,
-            accountStatus: 'active',
+            accountStatus: serverSession.accountStatus,
             currency: 'USD',
             usdToEgpRate: DEFAULT_USD_TO_EGP_RATE,
             language,
@@ -297,15 +356,36 @@ export default function App() {
 
       if (cancelled || !initialProfile) return;
 
+      if (initialProfile.accountStatus === 'suspended') {
+        setWorkspaceGate('suspended');
+        setCloudLoading(false);
+        return;
+      }
+
+      if (docExists && resolvedTenantId === firebaseUser.uid) {
+        void ensureExistingOwnerUserProfile({
+          uid: firebaseUser.uid,
+          email: firebaseUser.email || initialProfile.ownerEmail || '',
+          fullName: initialProfile.fullName || firebaseUser.displayName || '',
+          businessName: initialProfile.businessName,
+          photoUrl: initialProfile.photoUrl || firebaseUser.photoURL || undefined,
+        });
+      } else {
+        void touchUserLastActive(firebaseUser.uid);
+      }
+
       setAuthGateError(null);
       setHasCloudTenantDoc(docExists);
       setCloudProfile(initialProfile);
       setWorkspaceGate('active');
 
-      unsubFirestore = subscribeCloudWorkspace(firebaseUser.uid, {
+      unsubFirestore = subscribeCloudWorkspace(resolvedTenantId, {
         onProfile: (p) => {
           setHasCloudTenantDoc(true);
           setCloudProfile(p);
+          if (p.accountStatus === 'suspended') {
+            setWorkspaceGate('suspended');
+          }
         },
         onProducts: (p) => setCloudProducts(p),
         onCustomers: (c) => {
@@ -343,18 +423,31 @@ export default function App() {
   }, [authReady, firebaseUser, sessionNonce]);
 
   useEffect(() => {
+    if (activeSection.startsWith('sa_') && !isSuperAdmin) {
+      setActiveSection('dashboard');
+      return;
+    }
     if (activeSection === 'invitations' && !isAdmin) {
       setActiveSection('dashboard');
+      return;
     }
-  }, [activeSection, isAdmin]);
+    const permSection = navSectionToPermissionSection(activeSection);
+    if (permSection && !hasSectionPermission(userPermissions, userRole, permSection, 'view')) {
+      setActiveSection('dashboard');
+    }
+  }, [activeSection, isSuperAdmin, isAdmin, userPermissions, userRole]);
 
   const [language, setLanguage] = useState<AppLanguage>(
     () => readStoredLanguage(LOCAL_TENANT_ID) ?? 'en'
   );
 
+  const activeOwnerId = isCloudMode
+    ? sessionInfo?.tenantId || firebaseUser.uid
+    : LOCAL_TENANT_ID;
+
   const activeProfile: TenantProfile = isCloudMode
     ? cloudProfile ?? {
-        ownerId: firebaseUser.uid,
+        ownerId: activeOwnerId,
         businessName: 'ZENORATI Store',
         ownerEmail: firebaseUser.email || '',
         currency: 'USD',
@@ -364,8 +457,6 @@ export default function App() {
         lowStockThreshold: 12,
       }
     : localData.profile;
-
-  const activeOwnerId = isCloudMode ? firebaseUser.uid : LOCAL_TENANT_ID;
   const activeProducts = isCloudMode ? cloudProducts : localData.products;
   const activeCustomers = isCloudMode ? cloudCustomers : localData.customers;
   const activeOrders = isCloudMode ? cloudOrders : localData.orders;
@@ -403,7 +494,14 @@ export default function App() {
 
   useEffect(() => {
     if (!authReady || cloudLoading) return;
-    if (isCloudMode && (!cloudProfile || !hasCloudTenantDoc)) return;
+    if (
+      isCloudMode &&
+      (!cloudProfile ||
+        !hasCloudTenantDoc ||
+        !hasSectionPermission(userPermissions, userRole, 'settings', 'edit'))
+    ) {
+      return;
+    }
     const official = cbeSyncState?.officialRate;
     if (!official) return;
 
@@ -448,7 +546,7 @@ export default function App() {
     };
 
     if (isCloudMode && firebaseUser) {
-      void cloudSyncTenantCbeRate(firebaseUser.uid, patch).catch(() => {
+      void cloudSyncTenantCbeRate(activeOwnerId, patch).catch(() => {
         lastSyncedCbeSigRef.current = '';
       });
     } else {
@@ -470,6 +568,8 @@ export default function App() {
     firebaseUser,
     cbeSyncState,
     activeOwnerId,
+    userPermissions,
+    userRole,
     activeProfile.exchangeRateMode,
     activeProfile.cbeSellRate,
     activeProfile.cbeBuyRate,
@@ -574,12 +674,24 @@ export default function App() {
     }
   };
 
+  const assertSectionPermission = (
+    section: Parameters<typeof hasSectionPermission>[2],
+    action: Parameters<typeof hasSectionPermission>[3]
+  ) => {
+    if (!isCloudMode) return;
+    if (!hasSectionPermission(userPermissions, userRole, section, action)) {
+      const dict = language === 'ar' ? ar : en;
+      throw new Error(dict.saReadOnlyBanner);
+    }
+  };
+
   const handleSeedCloudSample = async () => {
     if (!firebaseUser) return;
+    assertSectionPermission('settings', 'edit');
     setSeedingCloud(true);
     setErrorBanner(null);
     try {
-      await seedCloudWorkspace(firebaseUser.uid, firebaseUser.email || 'owner@zenorati.app');
+      await seedCloudWorkspace(activeOwnerId, firebaseUser.email || 'owner@zenorati.app');
     } catch (err) {
       setErrorBanner(err instanceof Error ? err.message : 'Failed to load sample store data.');
     } finally {
@@ -598,13 +710,14 @@ export default function App() {
     writeStoredLanguage(resolvedLang, activeOwnerId);
 
     if (isCloudMode) {
+      assertSectionPermission('settings', 'edit');
       if (!hasCloudTenantDoc) {
         const dict = resolvedLang === 'ar' ? ar : en;
         throw new Error(
-          dict.missingTenantDocSaveError.replace('{{uid}}', firebaseUser.uid)
+          dict.missingTenantDocSaveError.replace('{{uid}}', activeOwnerId)
         );
       }
-      await cloudUpdateProfile(firebaseUser.uid, normalizedProfile);
+      await cloudUpdateProfile(activeOwnerId, normalizedProfile);
     } else {
       updateLocal((prev) => ({
         ...prev,
@@ -630,8 +743,11 @@ export default function App() {
           language: nextLang,
         };
         setCloudProfile(nextProfile);
-        if (hasCloudTenantDoc) {
-          void cloudUpdateProfile(firebaseUser.uid, nextProfile).catch((err) => {
+        if (
+          hasCloudTenantDoc &&
+          hasSectionPermission(userPermissions, userRole, 'settings', 'edit')
+        ) {
+          void cloudUpdateProfile(activeOwnerId, nextProfile).catch((err) => {
             setErrorBanner(
               err instanceof Error ? err.message : 'Unable to save language preference.'
             );
@@ -647,12 +763,22 @@ export default function App() {
         }));
       }
     },
-    [activeOwnerId, isCloudMode, firebaseUser, hasCloudTenantDoc, cloudProfile, activeProfile]
+    [
+      activeOwnerId,
+      isCloudMode,
+      firebaseUser,
+      hasCloudTenantDoc,
+      cloudProfile,
+      activeProfile,
+      userPermissions,
+      userRole,
+    ]
   );
 
   const handleSaveProduct = async (product: Product, isNew: boolean) => {
     if (isCloudMode) {
-      await cloudSaveProduct(firebaseUser.uid, product, isNew);
+      assertSectionPermission('products', isNew ? 'create' : 'edit');
+      await cloudSaveProduct(activeOwnerId, product, isNew);
     } else {
       updateLocal((prev) => ({
         ...prev,
@@ -673,7 +799,8 @@ export default function App() {
   const handleAdjustStock = async (product: Product, nextStock: number) => {
     const clamped = Math.max(0, Math.round(nextStock));
     if (isCloudMode) {
-      await cloudAdjustStock(firebaseUser.uid, product, clamped);
+      assertSectionPermission('inventory', 'edit');
+      await cloudAdjustStock(activeOwnerId, product, clamped);
     } else {
       updateLocal((prev) => ({
         ...prev,
@@ -695,7 +822,8 @@ export default function App() {
 
   const handleDeleteProduct = async (product: Product) => {
     if (isCloudMode) {
-      await cloudDeleteProduct(firebaseUser.uid, product);
+      assertSectionPermission('products', 'delete');
+      await cloudDeleteProduct(activeOwnerId, product);
     } else {
       updateLocal((prev) => ({
         ...prev,
@@ -722,10 +850,14 @@ export default function App() {
     };
 
     if (isCloudMode) {
-      if (reconciled.isNew || reconciled.changed) {
-        await cloudSaveCustomer(firebaseUser.uid, reconciled.customer, reconciled.isNew);
+      assertSectionPermission('orders', 'create');
+      if (
+        (reconciled.isNew || reconciled.changed) &&
+        hasSectionPermission(userPermissions, userRole, 'customers', reconciled.isNew ? 'create' : 'edit')
+      ) {
+        await cloudSaveCustomer(activeOwnerId, reconciled.customer, reconciled.isNew);
       }
-      await cloudCreateOrder(firebaseUser.uid, orderToSave, stockUpdates);
+      await cloudCreateOrder(activeOwnerId, orderToSave, stockUpdates);
     } else {
       const stockMap = new Map(stockUpdates.map((s) => [s.product.id, s.nextStock]));
       const nowIso = new Date().toISOString();
@@ -769,11 +901,15 @@ export default function App() {
       history: [historyEntry, ...(updatedOrder.history ?? [])],
     };
     if (isCloudMode) {
-      if (reconciled.isNew || reconciled.changed) {
-        await cloudSaveCustomer(firebaseUser.uid, reconciled.customer, reconciled.isNew);
+      assertSectionPermission('orders', 'edit');
+      if (
+        (reconciled.isNew || reconciled.changed) &&
+        hasSectionPermission(userPermissions, userRole, 'customers', reconciled.isNew ? 'create' : 'edit')
+      ) {
+        await cloudSaveCustomer(activeOwnerId, reconciled.customer, reconciled.isNew);
       }
       await cloudUpdateOrder(
-        firebaseUser.uid,
+        activeOwnerId,
         previousOrder,
         orderWithHistory,
         stockUpdates,
@@ -844,8 +980,9 @@ export default function App() {
     };
 
     if (isCloudMode) {
+      assertSectionPermission('orders', 'edit');
       await cloudUpdateOrderStatus(
-        firebaseUser.uid,
+        activeOwnerId,
         order,
         nextStatus,
         plan.nextStockDeducted,
@@ -881,7 +1018,8 @@ export default function App() {
   const handleDeleteOrder = async (order: Order) => {
     const stockUpdates = computeDeleteOrderStockPlan(activeProducts, order);
     if (isCloudMode) {
-      await cloudDeleteOrder(firebaseUser.uid, order, stockUpdates);
+      assertSectionPermission('orders', 'delete');
+      await cloudDeleteOrder(activeOwnerId, order, stockUpdates);
     } else {
       const stockMap = new Map(stockUpdates.map((s) => [s.product.id, s.nextStock]));
       const nowIso = new Date().toISOString();
@@ -909,7 +1047,8 @@ export default function App() {
 
   const handleSaveExpense = async (expense: Expense, isNew: boolean) => {
     if (isCloudMode) {
-      await cloudSaveExpense(firebaseUser.uid, expense, isNew);
+      assertSectionPermission('finance', isNew ? 'create' : 'edit');
+      await cloudSaveExpense(activeOwnerId, expense, isNew);
     } else {
       updateLocal((prev) => ({
         ...prev,
@@ -929,7 +1068,8 @@ export default function App() {
 
   const handleDeleteExpense = async (expense: Expense) => {
     if (isCloudMode) {
-      await cloudDeleteExpense(firebaseUser.uid, expense);
+      assertSectionPermission('finance', 'delete');
+      await cloudDeleteExpense(activeOwnerId, expense);
     } else {
       updateLocal((prev) => ({
         ...prev,
@@ -947,7 +1087,8 @@ export default function App() {
 
   const handleSaveCustomer = async (customer: Customer, isNew: boolean) => {
     if (isCloudMode) {
-      await cloudSaveCustomer(firebaseUser.uid, customer, isNew);
+      assertSectionPermission('customers', isNew ? 'create' : 'edit');
+      await cloudSaveCustomer(activeOwnerId, customer, isNew);
     } else {
       updateLocal((prev) => ({
         ...prev,
@@ -970,7 +1111,8 @@ export default function App() {
   const handleDeleteCustomer = async (customer: Customer) => {
     suppressedCustomerIdsRef.current.add(customer.id);
     if (isCloudMode) {
-      await cloudDeleteCustomer(firebaseUser.uid, customer);
+      assertSectionPermission('customers', 'delete');
+      await cloudDeleteCustomer(activeOwnerId, customer);
     } else {
       updateLocal((prev) => ({
         ...prev,
@@ -985,13 +1127,19 @@ export default function App() {
       const suppressed = ignoreSuppressed ? undefined : suppressedCustomerIdsRef.current;
 
       if (isCloudMode) {
-        if (!firebaseUser || !cloudHydrated.customers || !cloudHydrated.orders || !hasCloudTenantDoc) {
+        if (
+          !firebaseUser ||
+          !cloudHydrated.customers ||
+          !cloudHydrated.orders ||
+          !hasCloudTenantDoc ||
+          !hasSectionPermission(userPermissions, userRole, 'customers', 'create')
+        ) {
           return { created: 0, matched: 0 };
         }
         const plan = computeCustomerBackfillPlan(
           cloudCustomers,
           cloudOrders,
-          firebaseUser.uid,
+          activeOwnerId,
           suppressed
         );
         if (plan.customersToCreate.length === 0) {
@@ -1001,7 +1149,7 @@ export default function App() {
         syncingCustomersRef.current = true;
         setSyncingCustomers(true);
         try {
-          await cloudSyncCustomersFromOrders(firebaseUser.uid, plan);
+          await cloudSyncCustomersFromOrders(activeOwnerId, plan);
           return {
             created: plan.customersToCreate.length,
             matched: plan.matchedOrdersCount,
@@ -1042,9 +1190,12 @@ export default function App() {
     [
       isCloudMode,
       firebaseUser,
+      activeOwnerId,
       cloudHydrated.customers,
       cloudHydrated.orders,
       hasCloudTenantDoc,
+      userPermissions,
+      userRole,
       cloudCustomers,
       cloudOrders,
       localData.customers,
@@ -1054,7 +1205,15 @@ export default function App() {
 
   useEffect(() => {
     if (!authReady) return;
-    if (isCloudMode && (!cloudHydrated.customers || !cloudHydrated.orders || !hasCloudTenantDoc)) return;
+    if (
+      isCloudMode &&
+      (!cloudHydrated.customers ||
+        !cloudHydrated.orders ||
+        !hasCloudTenantDoc ||
+        !hasSectionPermission(userPermissions, userRole, 'customers', 'create'))
+    ) {
+      return;
+    }
     void runCustomerBackfillSync(false).catch((err) => {
       setErrorBanner(
         err instanceof Error ? err.message : 'Unable to synchronize customers from orders.'
@@ -1066,12 +1225,15 @@ export default function App() {
     cloudHydrated.customers,
     cloudHydrated.orders,
     hasCloudTenantDoc,
+    userPermissions,
+    userRole,
     runCustomerBackfillSync,
   ]);
 
   const handleSaveIdea = async (idea: ProductIdea, isNew: boolean) => {
     if (isCloudMode) {
-      await cloudSaveProductIdea(firebaseUser.uid, idea, isNew);
+      assertSectionPermission('products', isNew ? 'create' : 'edit');
+      await cloudSaveProductIdea(activeOwnerId, idea, isNew);
     } else {
       updateLocal((prev) => ({
         ...prev,
@@ -1084,7 +1246,8 @@ export default function App() {
 
   const handleDeleteIdea = async (ideaId: string) => {
     if (isCloudMode) {
-      await cloudDeleteProductIdea(firebaseUser.uid, ideaId);
+      assertSectionPermission('products', 'delete');
+      await cloudDeleteProductIdea(activeOwnerId, ideaId);
     } else {
       updateLocal((prev) => ({
         ...prev,
@@ -1123,6 +1286,36 @@ export default function App() {
     );
   }
 
+  if (firebaseUser && workspaceGate === 'suspended') {
+    const dict = language === 'ar' ? ar : en;
+    return (
+      <I18nProvider language={language} onChangeLanguage={handleChangeLanguage}>
+        <div className="min-h-screen flex items-center justify-center bg-slate-50 dark:bg-[#060B18] text-slate-900 dark:text-slate-100 p-6">
+          <div className="max-w-md w-full rounded-2xl border border-rose-500/30 bg-white dark:bg-[#0B1328] p-6 shadow-xl space-y-4 text-center">
+            <div className="w-12 h-12 rounded-2xl bg-rose-500/10 text-rose-600 dark:text-rose-400 flex items-center justify-center mx-auto">
+              <ShieldAlert className="w-6 h-6" aria-hidden="true" />
+            </div>
+            <h1 className="text-lg font-bold">{dict.saSuspendedTitle}</h1>
+            <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
+              {dict.saSuspendedDesc}
+            </p>
+            <div className="text-[11px] font-mono text-slate-400" dir="ltr">
+              {firebaseUser.email} · {firebaseUser.uid}
+            </div>
+            <button
+              type="button"
+              onClick={handleSignOut}
+              className="w-full inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-xs font-semibold text-white bg-rose-600 hover:bg-rose-500 cursor-pointer"
+            >
+              <LogOut className="w-4 h-4" aria-hidden="true" />
+              {dict.signOut}
+            </button>
+          </div>
+        </div>
+      </I18nProvider>
+    );
+  }
+
   if (!firebaseUser || workspaceGate !== 'active') {
     const gateMode =
       !firebaseUser
@@ -1146,6 +1339,15 @@ export default function App() {
     );
   }
 
+  const activePermSection = navSectionToPermissionSection(activeSection);
+  const isSectionReadOnly = Boolean(
+    isCloudMode &&
+      activePermSection &&
+      hasSectionPermission(userPermissions, userRole, activePermSection, 'view') &&
+      !hasSectionPermission(userPermissions, userRole, activePermSection, 'create') &&
+      !hasSectionPermission(userPermissions, userRole, activePermSection, 'edit')
+  );
+
   return (
     <I18nProvider language={language} onChangeLanguage={handleChangeLanguage}>
       <div className="min-h-screen flex bg-slate-50 dark:bg-[#060B18] text-slate-900 dark:text-slate-100">
@@ -1158,6 +1360,9 @@ export default function App() {
           isCloudMode={isCloudMode}
           lowStockCount={metrics.lowStockCount + metrics.outOfStockCount}
           isAdmin={isAdmin}
+          isSuperAdmin={isSuperAdmin}
+          userRole={userRole}
+          permissions={userPermissions}
         />
 
         <div className="flex-1 flex flex-col min-w-0">
@@ -1183,7 +1388,7 @@ export default function App() {
                   <div className="font-semibold">
                     {(language === 'ar' ? ar.missingTenantDocTitle : en.missingTenantDocTitle).replace(
                       '{{uid}}',
-                      firebaseUser.uid
+                      activeOwnerId
                     )}
                   </div>
                   <p className="text-[11px] leading-relaxed opacity-90">
@@ -1211,6 +1416,12 @@ export default function App() {
                     {language === 'ar' ? ar.authBackToSignInBtn : en.authBackToSignInBtn}
                   </button>
                 </div>
+              </div>
+            )}
+
+            {isSectionReadOnly && (
+              <div className="mb-5 rounded-2xl border border-blue-500/30 bg-blue-500/10 px-4 py-3 text-xs text-blue-800 dark:text-cyan-200">
+                {language === 'ar' ? ar.saReadOnlyBanner : en.saReadOnlyBanner}
               </div>
             )}
 
@@ -1264,23 +1475,40 @@ export default function App() {
                     searchQuery={searchQuery}
                     onNavigate={setActiveSection}
                     onSelectOrder={(order) => {
-                      setSelectedOrder(order);
-                      setActiveSection('orders');
+                      if (hasSectionPermission(userPermissions, userRole, 'orders', 'view')) {
+                        setSelectedOrder(order);
+                        setActiveSection('orders');
+                      }
                     }}
                     onOpenNewOrder={() => {
-                      setActiveSection('orders');
-                      setOrderModalOpen(true);
+                      if (hasSectionPermission(userPermissions, userRole, 'orders', 'create')) {
+                        setActiveSection('orders');
+                        setOrderModalOpen(true);
+                      }
                     }}
                     onOpenNewProduct={() => {
-                      setActiveSection('products');
-                      setProductModalOpen(true);
+                      if (hasSectionPermission(userPermissions, userRole, 'products', 'create')) {
+                        setActiveSection('products');
+                        setProductModalOpen(true);
+                      }
                     }}
                     onOpenNewExpense={() => {
-                      setActiveSection('finance');
-                      setExpenseModalOpen(true);
+                      if (hasSectionPermission(userPermissions, userRole, 'finance', 'create')) {
+                        setActiveSection('finance');
+                        setExpenseModalOpen(true);
+                      }
                     }}
-                    isCloudEmpty={isCloudEmpty && hasCloudTenantDoc}
-                    onSeedCloudSample={hasCloudTenantDoc ? handleSeedCloudSample : undefined}
+                    isCloudEmpty={
+                      isCloudEmpty &&
+                      hasCloudTenantDoc &&
+                      hasSectionPermission(userPermissions, userRole, 'settings', 'edit')
+                    }
+                    onSeedCloudSample={
+                      hasCloudTenantDoc &&
+                      hasSectionPermission(userPermissions, userRole, 'settings', 'edit')
+                        ? handleSeedCloudSample
+                        : undefined
+                    }
                     isSeeding={seedingCloud}
                   />
                 )}
@@ -1415,6 +1643,20 @@ export default function App() {
                 {activeSection === 'invitations' && isAdmin && firebaseUser && (
                   <AdminInvitationsView firebaseUser={firebaseUser} />
                 )}
+                {isSuperAdmin &&
+                  firebaseUser &&
+                  (activeSection === 'sa_overview' ||
+                    activeSection === 'sa_users' ||
+                    activeSection === 'sa_stores' ||
+                    activeSection === 'sa_invitations' ||
+                    activeSection === 'sa_roles' ||
+                    activeSection === 'sa_audit') && (
+                    <SuperAdminDashboardView
+                      activeSection={activeSection}
+                      firebaseUser={firebaseUser}
+                      onSelectSection={setActiveSection}
+                    />
+                  )}
                 {activeSection === 'settings' && (
                   <SettingsView
                     profile={{ ...activeProfile, language }}

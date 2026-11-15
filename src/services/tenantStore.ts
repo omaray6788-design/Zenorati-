@@ -123,7 +123,6 @@ export function loadLocalWorkspace(): WorkspaceDataset {
     // Fallback to fresh starter dataset
   }
   const initial = buildStarterWorkspaceData(LOCAL_TENANT_ID, 'owner@northstar-demo.local');
-  saveLocalWorkspace(initial);
   return initial;
 }
 
@@ -142,7 +141,16 @@ export function resetLocalWorkspace(): WorkspaceDataset {
 }
 
 function isValidUserRoleVal(val: unknown): val is TenantProfile['role'] {
-  return val === 'owner' || val === 'admin' || val === 'user';
+  return (
+    val === 'super_admin' ||
+    val === 'store_owner' ||
+    val === 'manager' ||
+    val === 'staff' ||
+    val === 'viewer' ||
+    val === 'owner' ||
+    val === 'admin' ||
+    val === 'user'
+  );
 }
 
 function isValidAccountStatusVal(val: unknown): val is TenantProfile['accountStatus'] {
@@ -200,6 +208,71 @@ export async function fetchExistingCloudTenantProfile(uid: string): Promise<Tena
       return null;
     }
     handleFirestoreError(error, OperationType.GET, path);
+  }
+}
+
+/**
+ * Safely ensures an existing store owner has a /users/{uid} record without modifying /tenants/{uid} or any business collections.
+ */
+export async function ensureExistingOwnerUserProfile(params: {
+  uid: string;
+  email: string;
+  fullName: string;
+  businessName: string;
+  photoUrl?: string;
+}): Promise<void> {
+  if (!params.uid || !params.email) return;
+  const userRef = doc(db, 'users', params.uid);
+  try {
+    const existing = await getDoc(userRef);
+    if (existing.exists()) {
+      await updateDoc(userRef, {
+        lastActiveAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      }).catch(() => undefined);
+      return;
+    }
+    await setDoc(userRef, {
+      uid: params.uid,
+      email: params.email.trim().toLowerCase().slice(0, 160),
+      fullName: (params.fullName || params.businessName || 'Owner').trim().slice(0, 120),
+      ...(params.photoUrl ? { photoUrl: params.photoUrl.slice(0, 500) } : {}),
+      role: 'store_owner',
+      accountStatus: 'active',
+      tenantId: params.uid,
+      businessName: (params.businessName || 'ZENORATI Store').trim().slice(0, 100),
+      permissions: {
+        products: { view: true, create: true, edit: true, delete: true },
+        orders: { view: true, create: true, edit: true, delete: true },
+        customers: { view: true, create: true, edit: true, delete: true },
+        inventory: { view: true, create: true, edit: true, delete: true },
+        finance: { view: true, create: true, edit: true, delete: true },
+        marketing: { view: true, create: true, edit: true, delete: true },
+        reports: { view: true, create: true, edit: true, delete: true },
+        settings: { view: true, create: true, edit: true, delete: true },
+      },
+      createdAt: serverTimestamp(),
+      lastActiveAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+  } catch {
+    // Non-blocking sync; never interrupt workspace access if user profile creation is deferred
+  }
+}
+
+export async function touchUserLastActive(uid: string): Promise<void> {
+  if (!uid) return;
+  try {
+    const userRef = doc(db, 'users', uid);
+    const snap = await getDoc(userRef);
+    if (snap.exists()) {
+      await updateDoc(userRef, {
+        lastActiveAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+    }
+  } catch {
+    // Silent non-blocking heartbeat
   }
 }
 
